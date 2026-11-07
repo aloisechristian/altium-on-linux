@@ -556,6 +556,13 @@ End Function'''
         with open(vbs_path, 'w', encoding='latin1', newline='') as f:
             f.write(content)
         print("Patch AltiumLL.vbs applicata!")
+
+    if 'dom.selectNodes ("//ROOT/Parts/")' in content or 'dom.selectNodes("//ROOT/Parts/")' in content:
+        content = content.replace('dom.selectNodes ("//ROOT/Parts/")', 'dom.selectNodes ("//ROOT/Parts/*")')
+        content = content.replace('dom.selectNodes("//ROOT/Parts/")', 'dom.selectNodes("//ROOT/Parts/*")')
+        with open(vbs_path, 'w', encoding='latin1', newline='') as f:
+            f.write(content)
+        print("Patch XPath //ROOT/Parts/* applicata a AltiumLL.vbs!")
 EOF
         log_succ "Altium Library Loader configurato con successo."
     fi
