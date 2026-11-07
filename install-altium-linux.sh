@@ -357,6 +357,18 @@ EOF
         cp -f "/home/christiana/custom-wine-dlls/x86_64-windows/d2d1-native.dll" "$TARGET_PREFIX/drive_c/windows/system32/d2d1.dll"
         log_succ "d2d1.dll ottimizzata installata in system32."
     fi
+    if [[ -f "/home/christiana/custom-wine-dlls/x86_64-windows/vbscript.dll" ]]; then
+        log_info "Installazione vbscript.dll ottimizzata (ActiveX IObjectWithSite fix)..."
+        cp -f "/home/christiana/custom-wine-dlls/x86_64-windows/vbscript.dll" "$TARGET_PREFIX/drive_c/windows/system32/vbscript.dll"
+        if [[ -d "/home/christiana/custom-wine-dist/usr/lib/wine/x86_64-windows" ]]; then
+            cp -f "/home/christiana/custom-wine-dlls/x86_64-windows/vbscript.dll" "/home/christiana/custom-wine-dist/usr/lib/wine/x86_64-windows/vbscript.dll" 2>/dev/null || true
+        fi
+        log_succ "vbscript.dll ottimizzata installata in system32."
+    elif [[ -f "$(dirname "$0")/binaries/x86_64-windows/vbscript.dll" ]]; then
+        log_info "Installazione vbscript.dll ottimizzata da binaries/..."
+        cp -f "$(dirname "$0")/binaries/x86_64-windows/vbscript.dll" "$TARGET_PREFIX/drive_c/windows/system32/vbscript.dll"
+        log_succ "vbscript.dll ottimizzata installata in system32."
+    fi
     if [[ -f "/home/christiana/custom-wine-dlls/x86_64-unix/win32u.so" ]]; then
         log_info "Sincronizzazione win32u.so ottimizzata (dirty surface tracking & epoll POLLIN re-arm)..."
         cp -f "/home/christiana/custom-wine-dlls/x86_64-unix/win32u.so" "$TARGET_PREFIX/win32u.so" 2>/dev/null || true
@@ -404,7 +416,7 @@ export WINEPREFIX="$TARGET_PREFIX"
 export WINEARCH="win64"
 export WINEDEBUG="-all"
 export WINEDLLPATH="/home/christiana/custom-wine-dlls:/home/christiana/wine-custom-libs:/usr/lib/wine/x86_64-unix:/usr/lib/wine/x86_64-windows"
-export WINEDLLOVERRIDES="d2d1=n,b;gdiplus=n,b"
+export WINEDLLOVERRIDES="d2d1=n,b;gdiplus=n,b;vbscript=n,b"
 
 # Disabilita VSync a livello driver e DXVK per ridisegno immediato e reattivo
 export __GL_SYNC_TO_VBLANK=0

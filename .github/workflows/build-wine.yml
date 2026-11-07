@@ -39,6 +39,9 @@ jobs:
             git apply ../patches/01-d2d1-schematic-glyph-cache-and-scale-fix.patch
             git apply ../patches/02-win32u-wineserver-poll-events-and-input.patch
           }
+          if [ -f ../patches/03-vbscript-axsite-iserviceprovider.patch ]; then
+            git apply ../patches/03-vbscript-axsite-iserviceprovider.patch
+          fi
 
       - name: Configure Wine
         run: |
@@ -46,12 +49,13 @@ jobs:
           cd build64
           ../wine-src/configure --enable-win64 --without-x --without-pulse --without-alsa
 
-      - name: Build d2d1.dll, win32u.so and wineserver
+      - name: Build d2d1.dll, win32u.so, wineserver and vbscript.dll
         run: |
           cd build64
           make -j$(nproc) dlls/d2d1/x86_64-windows/d2d1.dll
           make -j$(nproc) dlls/win32u/win32u.so
           make -j$(nproc) server/wineserver
+          make -j$(nproc) dlls/vbscript/x86_64-windows/vbscript.dll
 
       - name: Patch DOS Stub in d2d1.dll
         run: |
@@ -66,6 +70,7 @@ jobs:
         run: |
           mkdir -p dist/binaries/x86_64-windows dist/binaries/x86_64-unix
           cp -f build64/dlls/d2d1/x86_64-windows/d2d1.dll dist/binaries/x86_64-windows/
+          cp -f build64/dlls/vbscript/x86_64-windows/vbscript.dll dist/binaries/x86_64-windows/
           cp -f build64/dlls/win32u/win32u.so dist/binaries/x86_64-unix/
           cp -f build64/server/wineserver dist/binaries/x86_64-unix/
           tar -czvf altium-wine-binaries-linux-x86_64.tar.gz -C dist .
