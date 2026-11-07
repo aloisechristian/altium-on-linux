@@ -575,6 +575,18 @@ End Function'''
         with open(vbs_path, 'w', encoding='latin1', newline='') as f:
             f.write(content)
         print("Patch XPath //ROOT/Parts/* applicata a AltiumLL.vbs!")
+
+    if 'Sub ShowImages()' in content and 'On Error Resume Next' not in content.split('Sub ShowImages()')[1][:60]:
+        content = content.replace('Sub ShowImages()', 'Sub ShowImages()\r\n    On Error Resume Next\r\n    InitInstalledDir')
+        with open(vbs_path, 'w', encoding='latin1', newline='') as f:
+            f.write(content)
+
+    if 'Function ProcessSelectedPart(partID)' in content and 'InitInstalledDir' not in content.split('Function ProcessSelectedPart(partID)')[1][:200]:
+        old_psp = 'Function ProcessSelectedPart(partID)\r\n\r\n    If CheckLogin Then'
+        new_psp = '''Function ProcessSelectedPart(partID)\r\n    InitInstalledDir\r\n    Dim fsoCheck\r\n    Set fsoCheck = CreateObject("Scripting.FileSystemObject")\r\n    If Not fsoCheck.FolderExists(InstalledDir & "\\Temp") Then fsoCheck.CreateFolder(InstalledDir & "\\Temp")\r\n    Set fsoCheck = Nothing\r\n\r\n    If CheckLogin Then'''
+        content = content.replace(old_psp, new_psp)
+        with open(vbs_path, 'w', encoding='latin1', newline='') as f:
+            f.write(content)
 EOF
         log_succ "Altium Library Loader configurato con successo."
     fi
