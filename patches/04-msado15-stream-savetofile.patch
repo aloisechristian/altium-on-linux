@@ -1,0 +1,81 @@
+diff --git a/dlls/msado15/stream.c b/dlls/msado15/stream.c
+index cedb3f5..e21cef1 100644
+--- a/dlls/msado15/stream.c
++++ b/dlls/msado15/stream.c
+@@ -423,14 +423,72 @@ static HRESULT WINAPI stream_Flush( _Stream *iface )
+ 
+ static HRESULT WINAPI stream_SaveToFile( _Stream *iface, BSTR filename, SaveOptionsEnum options )
+ {
+-    FIXME( "%p, %s, %u\n", iface, debugstr_w(filename), options );
+-    return E_NOTIMPL;
++    struct stream *stream = impl_from_Stream( iface );
++    HANDLE file;
++    DWORD disposition, written;
++
++    TRACE( "%p, %s, %u\n", iface, debugstr_w(filename), options );
++
++    if (!filename || !filename[0]) return MAKE_ADO_HRESULT( adErrInvalidArgument );
++    if (stream->state == adStateClosed) return MAKE_ADO_HRESULT( adErrObjectClosed );
++
++    disposition = (options & adSaveCreateOverWrite) ? CREATE_ALWAYS : CREATE_NEW;
++    file = CreateFileW( filename, GENERIC_WRITE, FILE_SHARE_READ, NULL, disposition, FILE_ATTRIBUTE_NORMAL, NULL );
++    if (file == INVALID_HANDLE_VALUE)
++        return MAKE_ADO_HRESULT( adErrOpeningFile );
++
++    if (stream->size > 0 && stream->buf)
++    {
++        if (!WriteFile( file, stream->buf, stream->size, &written, NULL ) || written != stream->size)
++        {
++            CloseHandle( file );
++            return MAKE_ADO_HRESULT( adErrWriteFile );
++        }
++    }
++
++    CloseHandle( file );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI stream_LoadFromFile( _Stream *iface, BSTR filename )
+ {
+-    FIXME( "%p, %s\n", iface, debugstr_w(filename) );
+-    return E_NOTIMPL;
++    struct stream *stream = impl_from_Stream( iface );
++    HANDLE file;
++    DWORD size, read;
++    HRESULT hr;
++
++    TRACE( "%p, %s\n", iface, debugstr_w(filename) );
++
++    if (!filename || !filename[0]) return MAKE_ADO_HRESULT( adErrInvalidArgument );
++    if (stream->state == adStateClosed) return MAKE_ADO_HRESULT( adErrObjectClosed );
++
++    file = CreateFileW( filename, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
++    if (file == INVALID_HANDLE_VALUE)
++        return MAKE_ADO_HRESULT( adErrOpeningFile );
++
++    size = GetFileSize( file, NULL );
++    if (size == INVALID_FILE_SIZE)
++    {
++        CloseHandle( file );
++        return MAKE_ADO_HRESULT( adErrReadFile );
++    }
++
++    if ((hr = resize_buffer( stream, size )) != S_OK)
++    {
++        CloseHandle( file );
++        return hr;
++    }
++
++    if (size > 0 && !ReadFile( file, stream->buf, size, &read, NULL ))
++    {
++        CloseHandle( file );
++        return MAKE_ADO_HRESULT( adErrReadFile );
++    }
++
++    stream->size = size;
++    stream->pos = 0;
++    CloseHandle( file );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI stream_ReadText( _Stream *iface, LONG len, BSTR *ret )

@@ -42,6 +42,9 @@ jobs:
           if [ -f ../patches/03-vbscript-axsite-iserviceprovider.patch ]; then
             git apply ../patches/03-vbscript-axsite-iserviceprovider.patch
           fi
+          if [ -f ../patches/04-msado15-stream-savetofile.patch ]; then
+            git apply ../patches/04-msado15-stream-savetofile.patch
+          fi
 
       - name: Configure Wine
         run: |
@@ -56,6 +59,7 @@ jobs:
           make -j$(nproc) dlls/win32u/win32u.so
           make -j$(nproc) server/wineserver
           make -j$(nproc) dlls/vbscript/x86_64-windows/vbscript.dll
+          make -j$(nproc) dlls/msado15/x86_64-windows/msado15.dll
 
       - name: Patch DOS Stub in d2d1.dll
         run: |
@@ -71,6 +75,7 @@ jobs:
           mkdir -p dist/binaries/x86_64-windows dist/binaries/x86_64-unix
           cp -f build64/dlls/d2d1/x86_64-windows/d2d1.dll dist/binaries/x86_64-windows/
           cp -f build64/dlls/vbscript/x86_64-windows/vbscript.dll dist/binaries/x86_64-windows/
+          cp -f build64/dlls/msado15/x86_64-windows/msado15.dll dist/binaries/x86_64-windows/
           cp -f build64/dlls/win32u/win32u.so dist/binaries/x86_64-unix/
           cp -f build64/server/wineserver dist/binaries/x86_64-unix/
           tar -czvf altium-wine-binaries-linux-x86_64.tar.gz -C dist .
