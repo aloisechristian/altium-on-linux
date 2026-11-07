@@ -49,9 +49,9 @@ jobs:
       - name: Build d2d1.dll, win32u.so and wineserver
         run: |
           cd build64
-          make -j$(nproc) dlls/d2d1
-          make -j$(nproc) dlls/win32u
-          make -j$(nproc) server
+          make -j$(nproc) dlls/d2d1/x86_64-windows/d2d1.dll
+          make -j$(nproc) dlls/win32u/win32u.so
+          make -j$(nproc) server/wineserver
 
       - name: Patch DOS Stub in d2d1.dll
         run: |
