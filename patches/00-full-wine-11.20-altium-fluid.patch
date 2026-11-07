@@ -3620,3 +3620,31 @@ index b6c2f27..b34bc79 100644
 +        }
 +    }
 +}
+diff --git a/server/user.h b/server/user.h
+index f1a1f07..dbf8e7b 100644
+--- a/server/user.h
++++ b/server/user.h
+@@ -181,6 +181,7 @@ extern int is_window_transparent( user_handle_t window );
+ extern int make_window_active( user_handle_t window );
+ extern struct thread *get_window_thread( user_handle_t handle );
+ extern user_handle_t shallow_window_from_point( struct desktop *desktop, int x, int y );
++extern user_handle_t get_desktop_top_window( struct desktop *desktop );
+ extern struct thread *window_thread_from_point( user_handle_t scope, int x, int y );
+ extern user_handle_t find_window_to_repaint( user_handle_t parent, struct thread *thread );
+ extern struct window_class *get_window_class( user_handle_t window );
+diff --git a/server/window.c b/server/window.c
+index 3cd82b0..0adbd32 100644
+--- a/server/window.c
++++ b/server/window.c
+@@ -1055,6 +1055,11 @@ user_handle_t shallow_window_from_point( struct desktop *desktop, int x, int y )
+     return desktop->top_window->handle;
+ }
+ 
++user_handle_t get_desktop_top_window( struct desktop *desktop )
++{
++    return desktop->top_window ? desktop->top_window->handle : 0;
++}
++
+ /* return thread of top-most window containing point (in absolute raw coords) */
+ struct thread *window_thread_from_point( user_handle_t scope, int x, int y )
+ {
