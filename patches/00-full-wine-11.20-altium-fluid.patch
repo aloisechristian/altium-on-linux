@@ -1,0 +1,3622 @@
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index ba6cea7..e5a4836 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -170,6 +170,42 @@ struct d2d_indexed_objects
+     size_t count;
+ };
+ 
++#define D2D_GLYPH_CACHE_SIZE 8192
++#define D2D_GEOM_CACHE_SIZE 512
++
++struct d2d_glyph_cache_entry
++{
++    uint32_t hash;
++    IDWriteFontFace *font_face;
++    float em_size;
++    float m11, m12, m21, m22;
++    DWRITE_RENDERING_MODE rendering_mode;
++    DWRITE_MEASURING_MODE measuring_mode;
++    DWRITE_TEXT_ANTIALIAS_MODE antialias_mode;
++    UINT32 glyph_count;
++    BOOL is_sideways;
++    UINT32 bidi_level;
++    UINT16 *glyph_indices;
++    FLOAT *glyph_advances;
++    DWRITE_GLYPH_OFFSET *glyph_offsets;
++    ID2D1Bitmap *opacity_bitmap;
++    ID2D1BitmapBrush *opacity_brush;
++    RECT bounds;
++    BOOL empty;
++    BOOL valid;
++};
++
++struct d2d_geom_cache_entry
++{
++    uint32_t hash;
++    BOOL valid;
++    BOOL is_ellipse;
++    float params[6];
++    ID2D1Geometry *geometry;
++};
++
++struct d2d_face;
++
+ struct d2d_device_context
+ {
+     ID2D1DeviceContext6 ID2D1DeviceContext6_iface;
+@@ -186,6 +222,7 @@ struct d2d_device_context
+     struct d2d_device *device;
+     ID3D11Device1 *d3d_device;
+     ID3DDeviceContextState *d3d_state;
++    ID3DDeviceContextState *prev_d3d_state;
+     struct
+     {
+         ID2D1Image *object;
+@@ -221,6 +258,34 @@ struct d2d_device_context
+     struct d2d_clip_stack clip_stack;
+ 
+     struct d2d_indexed_objects vertex_buffers;
++
++    ID3D11Buffer *dynamic_vb;
++    unsigned int dynamic_vb_size;
++    unsigned int dynamic_vb_offset;
++    unsigned int last_vb_offset;
++    ID3D11Buffer *dynamic_ib;
++    unsigned int dynamic_ib_size;
++    unsigned int dynamic_ib_offset;
++    unsigned int last_ib_offset;
++    IDWriteFactory2 *dwrite_factory;
++
++    enum d2d_shape_type batch_shape_type;
++    struct d2d_vs_cb batch_vs_cb;
++    D2D1_COLOR_F batch_color;
++    float batch_opacity;
++    D3D11_RECT batch_scissor;
++    uint8_t *batch_vtx;
++    size_t batch_vtx_capacity;
++    unsigned int batch_vtx_count;
++    unsigned int batch_vtx_stride;
++    struct d2d_face *batch_faces;
++    size_t batch_face_capacity;
++    unsigned int batch_face_count;
++
++    unsigned int glyph_cache_clock;
++    struct d2d_glyph_cache_entry glyph_cache[D2D_GLYPH_CACHE_SIZE];
++    unsigned int geom_cache_clock;
++    struct d2d_geom_cache_entry geom_cache[D2D_GEOM_CACHE_SIZE];
+ };
+ 
+ HRESULT d2d_d3d_create_render_target(struct d2d_device *device, IDXGISurface *surface, IUnknown *outer_unknown,
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index 552d6d4..8e4ebaf 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -116,17 +116,36 @@ static void d2d_clip_stack_pop(struct d2d_clip_stack *stack)
+     --stack->count;
+ }
+ 
++static void d2d_device_context_leave_d3d_state(struct d2d_device_context *render_target)
++{
++    ID3D11DeviceContext1 *d3d_context;
++
++    if (!render_target->prev_d3d_state)
++        return;
++
++    if (render_target->cs)
++        EnterCriticalSection(render_target->cs);
++
++    ID3D11Device1_GetImmediateContext1(render_target->d3d_device, &d3d_context);
++    ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, render_target->prev_d3d_state, NULL);
++    ID3D11DeviceContext1_Release(d3d_context);
++    ID3DDeviceContextState_Release(render_target->prev_d3d_state);
++    render_target->prev_d3d_state = NULL;
++
++    if (render_target->cs)
++        LeaveCriticalSection(render_target->cs);
++}
++
+ static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
+         ID3D11Buffer *ib, unsigned int index_count, ID3D11Buffer *vb, unsigned int vb_stride,
+         struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+ {
+     struct d2d_shape_resources *shape_resources = &render_target->shape_resources[shape_type];
+-    ID3DDeviceContextState *prev_state;
+     ID3D11Device1 *device = render_target->d3d_device;
+     ID3D11DeviceContext1 *context;
+     ID3D11Buffer *vs_cb = render_target->vs_cb, *ps_cb = render_target->ps_cb;
+     D3D11_RECT scissor_rect;
+-    unsigned int offset;
++    unsigned int offset, ib_offset;
+     D3D11_VIEWPORT vp;
+ 
+     vp.TopLeftX = 0;
+@@ -140,12 +159,14 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
+         EnterCriticalSection(render_target->cs);
+ 
+     ID3D11Device1_GetImmediateContext1(device, &context);
+-    ID3D11DeviceContext1_SwapDeviceContextState(context, render_target->d3d_state, &prev_state);
++    if (!render_target->prev_d3d_state)
++        ID3D11DeviceContext1_SwapDeviceContextState(context, render_target->d3d_state, &render_target->prev_d3d_state);
+ 
+     ID3D11DeviceContext1_IASetInputLayout(context, shape_resources->il);
+     ID3D11DeviceContext1_IASetPrimitiveTopology(context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+-    ID3D11DeviceContext1_IASetIndexBuffer(context, ib, DXGI_FORMAT_R16_UINT, 0);
+-    offset = 0;
++    ib_offset = (ib && ib == render_target->dynamic_ib) ? render_target->last_ib_offset : 0;
++    ID3D11DeviceContext1_IASetIndexBuffer(context, ib, DXGI_FORMAT_R16_UINT, ib_offset);
++    offset = (vb && vb == render_target->dynamic_vb) ? render_target->last_vb_offset : 0;
+     ID3D11DeviceContext1_IASetVertexBuffers(context, 0, 1, &vb, &vb_stride, &offset);
+     ID3D11DeviceContext1_VSSetConstantBuffers(context, 0, 1, &vs_cb);
+     ID3D11DeviceContext1_VSSetShader(context, shape_resources->vs, NULL, 0);
+@@ -189,9 +210,7 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
+     else
+         ID3D11DeviceContext1_Draw(context, index_count, 0);
+ 
+-    ID3D11DeviceContext1_SwapDeviceContextState(context, prev_state, NULL);
+     ID3D11DeviceContext1_Release(context);
+-    ID3DDeviceContextState_Release(prev_state);
+ 
+     if (render_target->cs)
+         LeaveCriticalSection(render_target->cs);
+@@ -259,6 +278,42 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_AddRef(IUnknown *iface)
+     return refcount;
+ }
+ 
++static void d2d_glyph_cache_entry_clear(struct d2d_glyph_cache_entry *entry)
++{
++    if (!entry->valid)
++        return;
++    if (entry->font_face)
++        IDWriteFontFace_Release(entry->font_face);
++    if (entry->opacity_brush)
++        ID2D1BitmapBrush_Release(entry->opacity_brush);
++    if (entry->opacity_bitmap)
++        ID2D1Bitmap_Release(entry->opacity_bitmap);
++    free(entry->glyph_indices);
++    free(entry->glyph_advances);
++    free(entry->glyph_offsets);
++    memset(entry, 0, sizeof(*entry));
++}
++
++static void d2d_glyph_cache_cleanup(struct d2d_device_context *context)
++{
++    unsigned int i;
++
++    for (i = 0; i < D2D_GLYPH_CACHE_SIZE; ++i)
++        d2d_glyph_cache_entry_clear(&context->glyph_cache[i]);
++}
++
++static void d2d_geom_cache_cleanup(struct d2d_device_context *context)
++{
++    unsigned int i;
++
++    for (i = 0; i < D2D_GEOM_CACHE_SIZE; ++i)
++    {
++        if (context->geom_cache[i].valid && context->geom_cache[i].geometry)
++            ID2D1Geometry_Release(context->geom_cache[i].geometry);
++        memset(&context->geom_cache[i], 0, sizeof(context->geom_cache[i]));
++    }
++}
++
+ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
+ {
+     struct d2d_device_context *context = impl_from_IUnknown(iface);
+@@ -270,6 +325,11 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
+     {
+         unsigned int i, j, k;
+ 
++        d2d_device_context_leave_d3d_state(context);
++        d2d_glyph_cache_cleanup(context);
++        d2d_geom_cache_cleanup(context);
++        free(context->batch_vtx);
++        free(context->batch_faces);
+         d2d_clip_stack_cleanup(&context->clip_stack);
+         IDWriteRenderingParams_Release(context->default_text_rendering_params);
+         if (context->text_rendering_params)
+@@ -298,6 +358,12 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
+                 }
+             }
+         }
++        if (context->dynamic_vb)
++            ID3D11Buffer_Release(context->dynamic_vb);
++        if (context->dynamic_ib)
++            ID3D11Buffer_Release(context->dynamic_ib);
++        if (context->dwrite_factory)
++            IDWriteFactory2_Release(context->dwrite_factory);
+         if (context->d3d_state)
+             ID3DDeviceContextState_Release(context->d3d_state);
+         if (context->target.object)
+@@ -576,13 +642,439 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateMesh(ID2D1DeviceContex
+     return hr;
+ }
+ 
++static void d2d_device_context_fill_vs_cb_data(const struct d2d_device_context *context,
++        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width, struct d2d_vs_cb *cb_data)
++{
++    const D2D1_MATRIX_3X2_F *w = &context->drawing_state.transform;
++    float tmp_x, tmp_y;
++
++    cb_data->transform_geometry._11 = geometry_transform->_11;
++    cb_data->transform_geometry._21 = geometry_transform->_21;
++    cb_data->transform_geometry._31 = geometry_transform->_31;
++    cb_data->transform_geometry.pad0 = 0.0f;
++    cb_data->transform_geometry._12 = geometry_transform->_12;
++    cb_data->transform_geometry._22 = geometry_transform->_22;
++    cb_data->transform_geometry._32 = geometry_transform->_32;
++    cb_data->transform_geometry.stroke_width = stroke_width;
++
++    tmp_x = context->desc.dpiX / 96.0f;
++    cb_data->transform_rtx.x = w->_11 * tmp_x;
++    cb_data->transform_rtx.y = w->_21 * tmp_x;
++    cb_data->transform_rtx.z = w->_31 * tmp_x;
++    cb_data->transform_rtx.w = 2.0f / context->pixel_size.width;
++
++    tmp_y = context->desc.dpiY / 96.0f;
++    cb_data->transform_rty.x = w->_12 * tmp_y;
++    cb_data->transform_rty.y = w->_22 * tmp_y;
++    cb_data->transform_rty.z = w->_32 * tmp_y;
++    cb_data->transform_rty.w = -2.0f / context->pixel_size.height;
++}
++
++static void d2d_device_context_get_scissor_rect(const struct d2d_device_context *render_target,
++        D3D11_RECT *scissor_rect)
++{
++    if (render_target->clip_stack.count)
++    {
++        const D2D1_RECT_F *clip_rect = &render_target->clip_stack.stack[render_target->clip_stack.count - 1];
++        scissor_rect->left = ceilf(clip_rect->left - 0.5f);
++        scissor_rect->top = ceilf(clip_rect->top - 0.5f);
++        scissor_rect->right = ceilf(clip_rect->right - 0.5f);
++        scissor_rect->bottom = ceilf(clip_rect->bottom - 0.5f);
++    }
++    else
++    {
++        scissor_rect->left = 0;
++        scissor_rect->top = 0;
++        scissor_rect->right = render_target->pixel_size.width;
++        scissor_rect->bottom = render_target->pixel_size.height;
++    }
++}
++
++static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *context,
++        struct d2d_brush *brush, struct d2d_brush *opacity_brush, BOOL outline, BOOL is_arc)
++{
++    D3D11_MAPPED_SUBRESOURCE map_desc;
++    ID3D11DeviceContext *d3d_context;
++    struct d2d_ps_cb *cb_data;
++    HRESULT hr;
++
++    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
++
++    if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)context->ps_cb,
++            0, D3D11_MAP_WRITE_DISCARD, 0, &map_desc)))
++    {
++        WARN("Failed to map constant buffer, hr %#lx.\n", hr);
++        ID3D11DeviceContext_Release(d3d_context);
++        return hr;
++    }
++
++    cb_data = map_desc.pData;
++    cb_data->outline = outline;
++    cb_data->is_arc = is_arc;
++    cb_data->pad[0] = 0;
++    cb_data->pad[1] = 0;
++    if (!d2d_brush_fill_cb(brush, &cb_data->colour_brush))
++        WARN("Failed to initialize colour brush buffer.\n");
++    if (!d2d_brush_fill_cb(opacity_brush, &cb_data->opacity_brush))
++        WARN("Failed to initialize opacity brush buffer.\n");
++
++    ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->ps_cb, 0);
++    ID3D11DeviceContext_Release(d3d_context);
++
++    return hr;
++}
++
++static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
++        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width)
++{
++    D3D11_MAPPED_SUBRESOURCE map_desc;
++    ID3D11DeviceContext *d3d_context;
++    HRESULT hr;
++
++    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
++
++    if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)context->vs_cb,
++            0, D3D11_MAP_WRITE_DISCARD, 0, &map_desc)))
++    {
++        WARN("Failed to map constant buffer, hr %#lx.\n", hr);
++        ID3D11DeviceContext_Release(d3d_context);
++        return hr;
++    }
++
++    d2d_device_context_fill_vs_cb_data(context, geometry_transform, stroke_width, map_desc.pData);
++
++    ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->vs_cb, 0);
++    ID3D11DeviceContext_Release(d3d_context);
++
++    return S_OK;
++}
++
++static ID3D11Buffer *d2d_device_context_get_vb(struct d2d_device_context *context, const void *data, unsigned int size)
++{
++    unsigned int aligned_size = (size + 63) & ~63;
++    D3D11_MAPPED_SUBRESOURCE map_desc;
++    ID3D11DeviceContext *d3d_context;
++    D3D11_MAP map_type = D3D11_MAP_WRITE_NO_OVERWRITE;
++    HRESULT hr;
++
++    if (!data || !size)
++        return NULL;
++
++    if (!context->dynamic_vb || context->dynamic_vb_size < aligned_size)
++    {
++        D3D11_BUFFER_DESC buffer_desc;
++
++        if (context->dynamic_vb)
++        {
++            ID3D11Buffer_Release(context->dynamic_vb);
++            context->dynamic_vb = NULL;
++        }
++
++        context->dynamic_vb_size = max(aligned_size * 2, max(context->dynamic_vb_size * 2, 1048576));
++        context->dynamic_vb_offset = 0;
++        map_type = D3D11_MAP_WRITE_DISCARD;
++        buffer_desc.ByteWidth = (context->dynamic_vb_size + 63) & ~63;
++        buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
++        buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
++        buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
++        buffer_desc.MiscFlags = 0;
++        buffer_desc.StructureByteStride = 0;
++
++        if (FAILED(hr = ID3D11Device1_CreateBuffer(context->d3d_device, &buffer_desc, NULL, &context->dynamic_vb)))
++        {
++            ERR("Failed to create dynamic vertex buffer, hr %#lx.\n", hr);
++            context->dynamic_vb_size = 0;
++            return NULL;
++        }
++    }
++    else if (context->dynamic_vb_offset + aligned_size > context->dynamic_vb_size)
++    {
++        context->dynamic_vb_offset = 0;
++        map_type = D3D11_MAP_WRITE_DISCARD;
++    }
++
++    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
++    if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)context->dynamic_vb, 0,
++            map_type, 0, &map_desc)))
++    {
++        ERR("Failed to map dynamic vertex buffer, hr %#lx.\n", hr);
++        ID3D11DeviceContext_Release(d3d_context);
++        return NULL;
++    }
++    memcpy((BYTE *)map_desc.pData + context->dynamic_vb_offset, data, size);
++    ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->dynamic_vb, 0);
++    ID3D11DeviceContext_Release(d3d_context);
++
++    context->last_vb_offset = context->dynamic_vb_offset;
++    context->dynamic_vb_offset += aligned_size;
++
++    return context->dynamic_vb;
++}
++
++static ID3D11Buffer *d2d_device_context_get_ib(struct d2d_device_context *context, const void *data, unsigned int size)
++{
++    unsigned int aligned_size = (size + 63) & ~63;
++    D3D11_MAPPED_SUBRESOURCE map_desc;
++    ID3D11DeviceContext *d3d_context;
++    D3D11_MAP map_type = D3D11_MAP_WRITE_NO_OVERWRITE;
++    HRESULT hr;
++
++    if (!data || !size)
++        return NULL;
++
++    if (!context->dynamic_ib || context->dynamic_ib_size < aligned_size)
++    {
++        D3D11_BUFFER_DESC buffer_desc;
++
++        if (context->dynamic_ib)
++        {
++            ID3D11Buffer_Release(context->dynamic_ib);
++            context->dynamic_ib = NULL;
++        }
++
++        context->dynamic_ib_size = max(aligned_size * 2, max(context->dynamic_ib_size * 2, 262144));
++        context->dynamic_ib_offset = 0;
++        map_type = D3D11_MAP_WRITE_DISCARD;
++        buffer_desc.ByteWidth = (context->dynamic_ib_size + 63) & ~63;
++        buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
++        buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
++        buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
++        buffer_desc.MiscFlags = 0;
++        buffer_desc.StructureByteStride = 0;
++
++        if (FAILED(hr = ID3D11Device1_CreateBuffer(context->d3d_device, &buffer_desc, NULL, &context->dynamic_ib)))
++        {
++            ERR("Failed to create dynamic index buffer, hr %#lx.\n", hr);
++            context->dynamic_ib_size = 0;
++            return NULL;
++        }
++    }
++    else if (context->dynamic_ib_offset + aligned_size > context->dynamic_ib_size)
++    {
++        context->dynamic_ib_offset = 0;
++        map_type = D3D11_MAP_WRITE_DISCARD;
++    }
++
++    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
++    if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)context->dynamic_ib, 0,
++            map_type, 0, &map_desc)))
++    {
++        ERR("Failed to map dynamic index buffer, hr %#lx.\n", hr);
++        ID3D11DeviceContext_Release(d3d_context);
++        return NULL;
++    }
++    memcpy((BYTE *)map_desc.pData + context->dynamic_ib_offset, data, size);
++    ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->dynamic_ib, 0);
++    ID3D11DeviceContext_Release(d3d_context);
++
++    context->last_ib_offset = context->dynamic_ib_offset;
++    context->dynamic_ib_offset += aligned_size;
++
++    return context->dynamic_ib;
++}
++
++static void d2d_device_context_flush_batch(struct d2d_device_context *context)
++{
++    struct d2d_brush solid_brush = { .type = D2D_BRUSH_TYPE_SOLID };
++    D3D11_MAPPED_SUBRESOURCE map_desc;
++    ID3D11DeviceContext *d3d_context;
++    unsigned int vtx_count, face_count;
++    struct d2d_ps_cb *ps_cb_data;
++    ID3D11Buffer *ib, *vb;
++    HRESULT hr;
++
++    if (!context->batch_face_count || !context->batch_vtx_count)
++        return;
++
++    vtx_count = context->batch_vtx_count;
++    face_count = context->batch_face_count;
++    context->batch_vtx_count = 0;
++    context->batch_face_count = 0;
++
++    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
++
++    if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)context->vs_cb,
++            0, D3D11_MAP_WRITE_DISCARD, 0, &map_desc)))
++    {
++        WARN("Failed to map vs constant buffer, hr %#lx.\n", hr);
++        ID3D11DeviceContext_Release(d3d_context);
++        return;
++    }
++    memcpy(map_desc.pData, &context->batch_vs_cb, sizeof(context->batch_vs_cb));
++    ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->vs_cb, 0);
++
++    if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)context->ps_cb,
++            0, D3D11_MAP_WRITE_DISCARD, 0, &map_desc)))
++    {
++        WARN("Failed to map ps constant buffer, hr %#lx.\n", hr);
++        ID3D11DeviceContext_Release(d3d_context);
++        return;
++    }
++    ps_cb_data = map_desc.pData;
++    ps_cb_data->outline = (context->batch_shape_type == D2D_SHAPE_TYPE_OUTLINE);
++    ps_cb_data->is_arc = FALSE;
++    ps_cb_data->pad[0] = 0;
++    ps_cb_data->pad[1] = 0;
++    ps_cb_data->colour_brush.type = D2D_BRUSH_TYPE_SOLID;
++    ps_cb_data->colour_brush.opacity = context->batch_opacity;
++    ps_cb_data->colour_brush.pad[0] = 0;
++    ps_cb_data->colour_brush.pad[1] = 0;
++    ps_cb_data->colour_brush.u.solid.colour = context->batch_color;
++    ps_cb_data->opacity_brush.type = D2D_BRUSH_TYPE_COUNT;
++    ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->ps_cb, 0);
++    ID3D11DeviceContext_Release(d3d_context);
++
++    ib = d2d_device_context_get_ib(context, context->batch_faces,
++            face_count * sizeof(*context->batch_faces));
++    vb = d2d_device_context_get_vb(context, context->batch_vtx,
++            vtx_count * context->batch_vtx_stride);
++
++    if (ib && vb)
++        d2d_device_context_draw(context, context->batch_shape_type, ib, 3 * face_count, vb,
++                context->batch_vtx_stride, &solid_brush, NULL);
++}
++
++static BOOL d2d_device_context_batch_submit(struct d2d_device_context *context,
++        enum d2d_shape_type shape_type, const D2D_MATRIX_3X2_F *geometry_transform,
++        float stroke_width, struct d2d_brush *brush, const void *vertices,
++        unsigned int vertex_count, unsigned int stride,
++        const struct d2d_face *faces, unsigned int face_count)
++{
++    D3D11_RECT scissor;
++    struct d2d_vs_cb vs_cb;
++    D2D1_COLOR_F color;
++    float opacity;
++    unsigned int i, base_vtx;
++    struct d2d_face *dst_faces;
++
++    if (!brush || brush->type != D2D_BRUSH_TYPE_SOLID || !vertex_count || !face_count || vertex_count > 65532)
++        return FALSE;
++
++    d2d_device_context_fill_vs_cb_data(context, geometry_transform, stroke_width, &vs_cb);
++    d2d_device_context_get_scissor_rect(context, &scissor);
++
++    opacity = max(0.0f, min(brush->opacity, 1.0f));
++    color = brush->u.solid.color;
++    color.r *= color.a;
++    color.g *= color.a;
++    color.b *= color.a;
++
++    if (context->batch_face_count)
++    {
++        if (context->batch_shape_type != shape_type
++                || context->batch_vtx_stride != stride
++                || context->batch_vtx_count + vertex_count > 65532
++                || context->batch_opacity != opacity
++                || memcmp(&context->batch_color, &color, sizeof(color))
++                || memcmp(&context->batch_vs_cb, &vs_cb, sizeof(vs_cb))
++                || memcmp(&context->batch_scissor, &scissor, sizeof(scissor)))
++        {
++            d2d_device_context_flush_batch(context);
++        }
++    }
++
++    if (!context->batch_face_count)
++    {
++        context->batch_shape_type = shape_type;
++        context->batch_vtx_stride = stride;
++        context->batch_vs_cb = vs_cb;
++        context->batch_color = color;
++        context->batch_opacity = opacity;
++        context->batch_scissor = scissor;
++    }
++
++    if (!d2d_array_reserve((void **)&context->batch_vtx, &context->batch_vtx_capacity,
++            (context->batch_vtx_count + vertex_count) * stride, 1))
++        return FALSE;
++
++    if (!d2d_array_reserve((void **)&context->batch_faces, &context->batch_face_capacity,
++            context->batch_face_count + face_count, sizeof(*context->batch_faces)))
++        return FALSE;
++
++    base_vtx = context->batch_vtx_count;
++    memcpy(context->batch_vtx + base_vtx * stride, vertices, vertex_count * stride);
++    context->batch_vtx_count += vertex_count;
++
++    dst_faces = &context->batch_faces[context->batch_face_count];
++    for (i = 0; i < face_count; ++i)
++    {
++        dst_faces[i].v[0] = faces[i].v[0] + base_vtx;
++        dst_faces[i].v[1] = faces[i].v[1] + base_vtx;
++        dst_faces[i].v[2] = faces[i].v[2] + base_vtx;
++    }
++    context->batch_face_count += face_count;
++
++    return TRUE;
++}
++
++static ID2D1Geometry *d2d_device_context_get_cached_geometry(struct d2d_device_context *context,
++        BOOL is_ellipse, const float params[6])
++{
++    uint32_t hash = 2166136261u;
++    const uint8_t *bytes = (const uint8_t *)params;
++    struct d2d_geom_cache_entry *target = NULL;
++    ID2D1Geometry *geometry = NULL;
++    unsigned int i, step, idx;
++    HRESULT hr;
++
++    hash = (hash ^ (uint32_t)is_ellipse) * 16777619u;
++    for (i = 0; i < 6 * sizeof(float); ++i)
++        hash = (hash ^ bytes[i]) * 16777619u;
++
++    for (step = 0; step < 4; ++step)
++    {
++        struct d2d_geom_cache_entry *entry = &context->geom_cache[(hash + step) & (D2D_GEOM_CACHE_SIZE - 1)];
++        if (entry->valid && entry->hash == hash && entry->is_ellipse == is_ellipse
++                && !memcmp(entry->params, params, 6 * sizeof(float)))
++        {
++            return entry->geometry;
++        }
++        if (!entry->valid && !target)
++            target = entry;
++    }
++
++    if (is_ellipse)
++    {
++        D2D1_ELLIPSE e = {{params[0], params[1]}, params[2], params[3]};
++        hr = ID2D1Factory_CreateEllipseGeometry(context->factory, &e, (ID2D1EllipseGeometry **)&geometry);
++    }
++    else
++    {
++        D2D1_ROUNDED_RECT rr = {{params[0], params[1], params[2], params[3]}, params[4], params[5]};
++        hr = ID2D1Factory_CreateRoundedRectangleGeometry(context->factory, &rr,
++                (ID2D1RoundedRectangleGeometry **)&geometry);
++    }
++
++    if (FAILED(hr) || !geometry)
++        return NULL;
++
++    if (!target)
++    {
++        idx = (hash + (context->geom_cache_clock++ & 3)) & (D2D_GEOM_CACHE_SIZE - 1);
++        target = &context->geom_cache[idx];
++        if (target->valid && target->geometry)
++            ID2D1Geometry_Release(target->geometry);
++    }
++
++    target->hash = hash;
++    target->valid = TRUE;
++    target->is_ellipse = is_ellipse;
++    memcpy(target->params, params, 6 * sizeof(float));
++    target->geometry = geometry;
++
++    return geometry;
++}
++
+ static void STDMETHODCALLTYPE d2d_device_context_DrawLine(ID2D1DeviceContext6 *iface,
+         D2D1_POINT_2F p0, D2D1_POINT_2F p1, ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style)
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+-    ID2D1PathGeometry *geometry;
+-    ID2D1GeometrySink *sink;
+-    HRESULT hr;
++    struct d2d_brush *brush_impl = unsafe_impl_from_ID2D1Brush(brush);
++    struct d2d_stroke_style *stroke_style_impl = unsafe_impl_from_ID2D1StrokeStyle(stroke_style);
++    struct d2d_outline_vertex v[4];
++    static const struct d2d_face f[2] = {{{0, 1, 2}}, {{2, 1, 3}}};
++    float dx, dy, len, qx, qy;
++    ID3D11Buffer *ib, *vb;
+ 
+     TRACE("iface %p, p0 %s, p1 %s, brush %p, stroke_width %.8e, stroke_style %p.\n",
+             iface, debug_d2d_point_2f(&p0), debug_d2d_point_2f(&p1), brush, stroke_width, stroke_style);
+@@ -590,42 +1082,63 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawLine(ID2D1DeviceContext6 *i
+     if (FAILED(context->error.code))
+         return;
+ 
+-    if (context->target.type == D2D_TARGET_COMMAND_LIST)
++    if (context->target.type == D2D_TARGET_UNKNOWN)
+     {
+-        d2d_command_list_draw_line(context->target.command_list, context, p0, p1, brush, stroke_width, stroke_style);
++        d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
+         return;
+     }
+ 
+-    if (FAILED(hr = ID2D1Factory_CreatePathGeometry(context->factory, &geometry)))
++    if (context->target.type == D2D_TARGET_COMMAND_LIST)
+     {
+-        WARN("Failed to create path geometry, hr %#lx.\n", hr);
++        d2d_command_list_draw_line(context->target.command_list, context, p0, p1, brush, stroke_width, stroke_style);
+         return;
+     }
+ 
+-    if (FAILED(hr = ID2D1PathGeometry_Open(geometry, &sink)))
+-    {
+-        WARN("Failed to open geometry sink, hr %#lx.\n", hr);
+-        ID2D1PathGeometry_Release(geometry);
++    if (stroke_style_impl && stroke_style_impl->desc.transformType == D2D1_STROKE_TRANSFORM_TYPE_FIXED)
++        stroke_width /= context->drawing_state.transform.m11;
++
++    dx = p1.x - p0.x;
++    dy = p1.y - p0.y;
++    len = sqrtf(dx * dx + dy * dy);
++    qx = len != 0.0f ? dx / len : 0.0f;
++    qy = len != 0.0f ? dy / len : 0.0f;
++
++    v[0].position = p0; v[0].prev.x =  qx; v[0].prev.y =  qy; v[0].next.x =  qx; v[0].next.y =  qy;
++    v[1].position = p0; v[1].prev.x = -qx; v[1].prev.y = -qy; v[1].next.x = -qx; v[1].next.y = -qy;
++    v[2].position = p1; v[2].prev.x =  qx; v[2].prev.y =  qy; v[2].next.x =  qx; v[2].next.y =  qy;
++    v[3].position = p1; v[3].prev.x = -qx; v[3].prev.y = -qy; v[3].next.x = -qx; v[3].next.y = -qy;
++
++    if (d2d_device_context_batch_submit(context, D2D_SHAPE_TYPE_OUTLINE, &identity, stroke_width,
++            brush_impl, v, 4, sizeof(*v), f, 2))
+         return;
+-    }
+ 
+-    ID2D1GeometrySink_BeginFigure(sink, p0, D2D1_FIGURE_BEGIN_HOLLOW);
+-    ID2D1GeometrySink_AddLine(sink, p1);
+-    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_OPEN);
+-    if (FAILED(hr = ID2D1GeometrySink_Close(sink)))
+-        WARN("Failed to close geometry sink, hr %#lx.\n", hr);
+-    ID2D1GeometrySink_Release(sink);
++    d2d_device_context_flush_batch(context);
++    if (FAILED(d2d_device_context_update_vs_cb(context, &identity, stroke_width)))
++        return;
++    if (FAILED(d2d_device_context_update_ps_cb(context, brush_impl, NULL, TRUE, FALSE)))
++        return;
+ 
+-    ID2D1DeviceContext6_DrawGeometry(iface, (ID2D1Geometry *)geometry, brush, stroke_width, stroke_style);
+-    ID2D1PathGeometry_Release(geometry);
++    ib = d2d_device_context_get_ib(context, f, sizeof(f));
++    vb = d2d_device_context_get_vb(context, v, sizeof(v));
++    if (ib && vb)
++        d2d_device_context_draw(context, D2D_SHAPE_TYPE_OUTLINE, ib, 6, vb, sizeof(*v), brush_impl, NULL);
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_DrawRectangle(ID2D1DeviceContext6 *iface,
+         const D2D1_RECT_F *rect, ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style)
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+-    ID2D1RectangleGeometry *geometry;
+-    HRESULT hr;
++    struct d2d_brush *brush_impl = unsafe_impl_from_ID2D1Brush(brush);
++    struct d2d_stroke_style *stroke_style_impl = unsafe_impl_from_ID2D1StrokeStyle(stroke_style);
++    struct d2d_outline_vertex v[32];
++    struct d2d_face f[16];
++    D2D1_POINT_2F c[4];
++    float l, r, t, b;
++    unsigned int i;
++    ID3D11Buffer *ib, *vb;
++
++    static const D2D1_POINT_2F prev[4] = {{ 1.0f,  0.0f}, { 0.0f, -1.0f}, {-1.0f,  0.0f}, { 0.0f,  1.0f}};
++    static const D2D1_POINT_2F next[4] = {{ 0.0f,  1.0f}, { 1.0f,  0.0f}, { 0.0f, -1.0f}, {-1.0f,  0.0f}};
+ 
+     TRACE("iface %p, rect %s, brush %p, stroke_width %.8e, stroke_style %p.\n",
+             iface, debug_d2d_rect_f(rect), brush, stroke_width, stroke_style);
+@@ -633,232 +1146,249 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawRectangle(ID2D1DeviceContex
+     if (FAILED(context->error.code))
+         return;
+ 
++    if (context->target.type == D2D_TARGET_UNKNOWN)
++    {
++        d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
++        return;
++    }
++
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+     {
+         d2d_command_list_draw_rectangle(context->target.command_list, context, rect, brush, stroke_width, stroke_style);
+         return;
+     }
+ 
+-    if (FAILED(hr = ID2D1Factory_CreateRectangleGeometry(context->factory, rect, &geometry)))
++    if (stroke_style_impl && stroke_style_impl->desc.transformType == D2D1_STROKE_TRANSFORM_TYPE_FIXED)
++        stroke_width /= context->drawing_state.transform.m11;
++
++    l = min(rect->left, rect->right);
++    r = max(rect->left, rect->right);
++    t = min(rect->top, rect->bottom);
++    b = max(rect->top, rect->bottom);
++
++    c[0].x = l; c[0].y = t;
++    c[1].x = l; c[1].y = b;
++    c[2].x = r; c[2].y = b;
++    c[3].x = r; c[3].y = t;
++
++    for (i = 0; i < 4; ++i)
+     {
+-        ERR("Failed to create geometry, hr %#lx.\n", hr);
+-        return;
++        const D2D1_POINT_2F *p0 = &c[i];
++        const D2D1_POINT_2F *p1 = &c[(i + 1) & 3];
++        float dx = p1->x - p0->x, dy = p1->y - p0->y;
++        float len = sqrtf(dx * dx + dy * dy);
++        float qx = len != 0.0f ? dx / len : 0.0f;
++        float qy = len != 0.0f ? dy / len : 0.0f;
++        unsigned int bv = i * 4, bf = i * 2;
++
++        v[bv + 0].position = *p0; v[bv + 0].prev.x =  qx; v[bv + 0].prev.y =  qy; v[bv + 0].next.x =  qx; v[bv + 0].next.y =  qy;
++        v[bv + 1].position = *p0; v[bv + 1].prev.x = -qx; v[bv + 1].prev.y = -qy; v[bv + 1].next.x = -qx; v[bv + 1].next.y = -qy;
++        v[bv + 2].position = *p1; v[bv + 2].prev.x =  qx; v[bv + 2].prev.y =  qy; v[bv + 2].next.x =  qx; v[bv + 2].next.y =  qy;
++        v[bv + 3].position = *p1; v[bv + 3].prev.x = -qx; v[bv + 3].prev.y = -qy; v[bv + 3].next.x = -qx; v[bv + 3].next.y = -qy;
++
++        f[bf + 0].v[0] = bv + 0; f[bf + 0].v[1] = bv + 1; f[bf + 0].v[2] = bv + 2;
++        f[bf + 1].v[0] = bv + 2; f[bf + 1].v[1] = bv + 1; f[bf + 1].v[2] = bv + 3;
+     }
+ 
+-    ID2D1DeviceContext6_DrawGeometry(iface, (ID2D1Geometry *)geometry, brush, stroke_width, stroke_style);
+-    ID2D1RectangleGeometry_Release(geometry);
++    for (i = 0; i < 4; ++i)
++    {
++        const D2D1_POINT_2F *p0 = &c[i];
++        unsigned int bv = 16 + i * 4, bf = 8 + i * 2;
++
++        v[bv + 0].position = *p0; v[bv + 0].prev = prev[i]; v[bv + 0].next.x = -next[i].x; v[bv + 0].next.y = -next[i].y;
++        v[bv + 1].position = *p0; v[bv + 1].prev.x = -prev[i].x; v[bv + 1].prev.y = -prev[i].y; v[bv + 1].next.x = -prev[i].x; v[bv + 1].next.y = -prev[i].y;
++        v[bv + 2].position = *p0; v[bv + 2].prev.x = -prev[i].x; v[bv + 2].prev.y = -prev[i].y; v[bv + 2].next = next[i];
++        v[bv + 3].position = *p0; v[bv + 3].prev = next[i]; v[bv + 3].next = next[i];
++
++        f[bf + 0].v[0] = bv + 1; f[bf + 0].v[1] = bv + 0; f[bf + 0].v[2] = bv + 2;
++        f[bf + 1].v[0] = bv + 2; f[bf + 1].v[1] = bv + 0; f[bf + 1].v[2] = bv + 3;
++    }
++
++    if (d2d_device_context_batch_submit(context, D2D_SHAPE_TYPE_OUTLINE, &identity, stroke_width,
++            brush_impl, v, 32, sizeof(*v), f, 16))
++        return;
++
++    d2d_device_context_flush_batch(context);
++    if (FAILED(d2d_device_context_update_vs_cb(context, &identity, stroke_width)))
++        return;
++    if (FAILED(d2d_device_context_update_ps_cb(context, brush_impl, NULL, TRUE, FALSE)))
++        return;
++
++    ib = d2d_device_context_get_ib(context, f, sizeof(f));
++    vb = d2d_device_context_get_vb(context, v, sizeof(v));
++    if (ib && vb)
++        d2d_device_context_draw(context, D2D_SHAPE_TYPE_OUTLINE, ib, 48, vb, sizeof(*v), brush_impl, NULL);
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_FillRectangle(ID2D1DeviceContext6 *iface,
+         const D2D1_RECT_F *rect, ID2D1Brush *brush)
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+-    ID2D1RectangleGeometry *geometry;
+-    HRESULT hr;
++    struct d2d_brush *brush_impl = unsafe_impl_from_ID2D1Brush(brush);
++    float l, r, t, b;
++    D2D1_POINT_2F v[4];
++    static const struct d2d_face f[2] = {{{1, 2, 0}}, {{0, 2, 3}}};
++    ID3D11Buffer *ib, *vb;
+ 
+     TRACE("iface %p, rect %s, brush %p.\n", iface, debug_d2d_rect_f(rect), brush);
+ 
+     if (FAILED(context->error.code))
+         return;
+ 
+-    if (context->target.type == D2D_TARGET_COMMAND_LIST)
++    if (context->target.type == D2D_TARGET_UNKNOWN)
+     {
+-        d2d_command_list_fill_rectangle(context->target.command_list, context, rect, brush);
++        d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
+         return;
+     }
+ 
+-    if (FAILED(hr = ID2D1Factory_CreateRectangleGeometry(context->factory, rect, &geometry)))
++    if (context->target.type == D2D_TARGET_COMMAND_LIST)
+     {
+-        ERR("Failed to create geometry, hr %#lx.\n", hr);
++        d2d_command_list_fill_rectangle(context->target.command_list, context, rect, brush);
+         return;
+     }
+ 
+-    ID2D1DeviceContext6_FillGeometry(iface, (ID2D1Geometry *)geometry, brush, NULL);
+-    ID2D1RectangleGeometry_Release(geometry);
+-}
++    l = min(rect->left, rect->right);
++    r = max(rect->left, rect->right);
++    t = min(rect->top, rect->bottom);
++    b = max(rect->top, rect->bottom);
+ 
+-static void STDMETHODCALLTYPE d2d_device_context_DrawRoundedRectangle(ID2D1DeviceContext6 *iface,
+-        const D2D1_ROUNDED_RECT *rect, ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style)
+-{
+-    struct d2d_device_context *render_target = impl_from_ID2D1DeviceContext(iface);
+-    ID2D1RoundedRectangleGeometry *geometry;
+-    HRESULT hr;
+-
+-    TRACE("iface %p, rect %p, brush %p, stroke_width %.8e, stroke_style %p.\n",
+-            iface, rect, brush, stroke_width, stroke_style);
++    v[0].x = l; v[0].y = t;
++    v[1].x = l; v[1].y = b;
++    v[2].x = r; v[2].y = b;
++    v[3].x = r; v[3].y = t;
+ 
+-    if (FAILED(render_target->error.code))
++    if (d2d_device_context_batch_submit(context, D2D_SHAPE_TYPE_TRIANGLE, &identity, 0.0f,
++            brush_impl, v, 4, sizeof(*v), f, 2))
+         return;
+ 
+-    if (FAILED(hr = ID2D1Factory_CreateRoundedRectangleGeometry(render_target->factory, rect, &geometry)))
+-    {
+-        ERR("Failed to create geometry, hr %#lx.\n", hr);
++    d2d_device_context_flush_batch(context);
++    if (FAILED(d2d_device_context_update_vs_cb(context, &identity, 0.0f)))
++        return;
++    if (FAILED(d2d_device_context_update_ps_cb(context, brush_impl, NULL, FALSE, FALSE)))
+         return;
+-    }
+ 
+-    ID2D1DeviceContext6_DrawGeometry(iface, (ID2D1Geometry *)geometry, brush, stroke_width, stroke_style);
+-    ID2D1RoundedRectangleGeometry_Release(geometry);
++    ib = d2d_device_context_get_ib(context, f, sizeof(f));
++    vb = d2d_device_context_get_vb(context, v, sizeof(v));
++    if (ib && vb)
++        d2d_device_context_draw(context, D2D_SHAPE_TYPE_TRIANGLE, ib, 6, vb, sizeof(*v), brush_impl, NULL);
+ }
+ 
+-static void STDMETHODCALLTYPE d2d_device_context_FillRoundedRectangle(ID2D1DeviceContext6 *iface,
+-        const D2D1_ROUNDED_RECT *rect, ID2D1Brush *brush)
++static void STDMETHODCALLTYPE d2d_device_context_DrawRoundedRectangle(ID2D1DeviceContext6 *iface,
++        const D2D1_ROUNDED_RECT *rect, ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style)
+ {
+     struct d2d_device_context *render_target = impl_from_ID2D1DeviceContext(iface);
+-    ID2D1RoundedRectangleGeometry *geometry;
+-    HRESULT hr;
++    ID2D1Geometry *geometry;
++    float params[6];
+ 
+-    TRACE("iface %p, rect %p, brush %p.\n", iface, rect, brush);
++    TRACE("iface %p, rect %p, brush %p, stroke_width %.8e, stroke_style %p.\n",
++            iface, rect, brush, stroke_width, stroke_style);
+ 
+     if (FAILED(render_target->error.code))
+         return;
+ 
+-    if (FAILED(hr = ID2D1Factory_CreateRoundedRectangleGeometry(render_target->factory, rect, &geometry)))
++    if (rect->radiusX == 0.0f && rect->radiusY == 0.0f)
+     {
+-        ERR("Failed to create geometry, hr %#lx.\n", hr);
++        d2d_device_context_DrawRectangle(iface, &rect->rect, brush, stroke_width, stroke_style);
+         return;
+     }
+ 
+-    ID2D1DeviceContext6_FillGeometry(iface, (ID2D1Geometry *)geometry, brush, NULL);
+-    ID2D1RoundedRectangleGeometry_Release(geometry);
+-}
+-
+-static void STDMETHODCALLTYPE d2d_device_context_DrawEllipse(ID2D1DeviceContext6 *iface,
+-        const D2D1_ELLIPSE *ellipse, ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style)
+-{
+-    struct d2d_device_context *render_target = impl_from_ID2D1DeviceContext(iface);
+-    ID2D1EllipseGeometry *geometry;
+-    HRESULT hr;
+-
+-    TRACE("iface %p, ellipse %p, brush %p, stroke_width %.8e, stroke_style %p.\n",
+-            iface, ellipse, brush, stroke_width, stroke_style);
+-
+-    if (FAILED(render_target->error.code))
+-        return;
++    params[0] = rect->rect.left;
++    params[1] = rect->rect.top;
++    params[2] = rect->rect.right;
++    params[3] = rect->rect.bottom;
++    params[4] = rect->radiusX;
++    params[5] = rect->radiusY;
+ 
+-    if (FAILED(hr = ID2D1Factory_CreateEllipseGeometry(render_target->factory, ellipse, &geometry)))
+-    {
+-        ERR("Failed to create geometry, hr %#lx.\n", hr);
++    if (!(geometry = d2d_device_context_get_cached_geometry(render_target, FALSE, params)))
+         return;
+-    }
+ 
+-    ID2D1DeviceContext6_DrawGeometry(iface, (ID2D1Geometry *)geometry, brush, stroke_width, stroke_style);
+-    ID2D1EllipseGeometry_Release(geometry);
++    ID2D1DeviceContext6_DrawGeometry(iface, geometry, brush, stroke_width, stroke_style);
+ }
+ 
+-static void STDMETHODCALLTYPE d2d_device_context_FillEllipse(ID2D1DeviceContext6 *iface,
+-        const D2D1_ELLIPSE *ellipse, ID2D1Brush *brush)
++static void STDMETHODCALLTYPE d2d_device_context_FillRoundedRectangle(ID2D1DeviceContext6 *iface,
++        const D2D1_ROUNDED_RECT *rect, ID2D1Brush *brush)
+ {
+     struct d2d_device_context *render_target = impl_from_ID2D1DeviceContext(iface);
+-    ID2D1EllipseGeometry *geometry;
+-    HRESULT hr;
++    ID2D1Geometry *geometry;
++    float params[6];
+ 
+-    TRACE("iface %p, ellipse %p, brush %p.\n", iface, ellipse, brush);
++    TRACE("iface %p, rect %p, brush %p.\n", iface, rect, brush);
+ 
+     if (FAILED(render_target->error.code))
+         return;
+ 
+-    if (FAILED(hr = ID2D1Factory_CreateEllipseGeometry(render_target->factory, ellipse, &geometry)))
++    if (rect->radiusX == 0.0f && rect->radiusY == 0.0f)
+     {
+-        ERR("Failed to create geometry, hr %#lx.\n", hr);
++        d2d_device_context_FillRectangle(iface, &rect->rect, brush);
+         return;
+     }
+ 
+-    ID2D1DeviceContext6_FillGeometry(iface, (ID2D1Geometry *)geometry, brush, NULL);
+-    ID2D1EllipseGeometry_Release(geometry);
+-}
+-
+-static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *context,
+-        struct d2d_brush *brush, struct d2d_brush *opacity_brush, BOOL outline, BOOL is_arc)
+-{
+-    D3D11_MAPPED_SUBRESOURCE map_desc;
+-    ID3D11DeviceContext *d3d_context;
+-    struct d2d_ps_cb *cb_data;
+-    HRESULT hr;
+-
+-    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+-
+-    if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)context->ps_cb,
+-            0, D3D11_MAP_WRITE_DISCARD, 0, &map_desc)))
+-    {
+-        WARN("Failed to map constant buffer, hr %#lx.\n", hr);
+-        ID3D11DeviceContext_Release(d3d_context);
+-        return hr;
+-    }
+-
+-    cb_data = map_desc.pData;
+-    cb_data->outline = outline;
+-    cb_data->is_arc = is_arc;
+-    cb_data->pad[0] = 0;
+-    cb_data->pad[1] = 0;
+-    if (!d2d_brush_fill_cb(brush, &cb_data->colour_brush))
+-        WARN("Failed to initialize colour brush buffer.\n");
+-    if (!d2d_brush_fill_cb(opacity_brush, &cb_data->opacity_brush))
+-        WARN("Failed to initialize opacity brush buffer.\n");
++    params[0] = rect->rect.left;
++    params[1] = rect->rect.top;
++    params[2] = rect->rect.right;
++    params[3] = rect->rect.bottom;
++    params[4] = rect->radiusX;
++    params[5] = rect->radiusY;
+ 
+-    ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->ps_cb, 0);
+-    ID3D11DeviceContext_Release(d3d_context);
++    if (!(geometry = d2d_device_context_get_cached_geometry(render_target, FALSE, params)))
++        return;
+ 
+-    return hr;
++    ID2D1DeviceContext6_FillGeometry(iface, geometry, brush, NULL);
+ }
+ 
+-static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
+-        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width)
+-{
+-    D3D11_MAPPED_SUBRESOURCE map_desc;
+-    ID3D11DeviceContext *d3d_context;
+-    const D2D1_MATRIX_3X2_F *w;
+-    struct d2d_vs_cb *cb_data;
+-    float tmp_x, tmp_y;
+-    HRESULT hr;
++static void STDMETHODCALLTYPE d2d_device_context_DrawEllipse(ID2D1DeviceContext6 *iface,
++        const D2D1_ELLIPSE *ellipse, ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style)
++{
++    struct d2d_device_context *render_target = impl_from_ID2D1DeviceContext(iface);
++    ID2D1Geometry *geometry;
++    float params[6] = {ellipse->point.x, ellipse->point.y, ellipse->radiusX, ellipse->radiusY, 0.0f, 0.0f};
+ 
+-    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
++    TRACE("iface %p, ellipse %p, brush %p, stroke_width %.8e, stroke_style %p.\n",
++            iface, ellipse, brush, stroke_width, stroke_style);
+ 
+-    if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)context->vs_cb,
+-            0, D3D11_MAP_WRITE_DISCARD, 0, &map_desc)))
+-    {
+-        WARN("Failed to map constant buffer, hr %#lx.\n", hr);
+-        ID3D11DeviceContext_Release(d3d_context);
+-        return hr;
+-    }
++    if (FAILED(render_target->error.code))
++        return;
+ 
+-    cb_data = map_desc.pData;
+-    cb_data->transform_geometry._11 = geometry_transform->_11;
+-    cb_data->transform_geometry._21 = geometry_transform->_21;
+-    cb_data->transform_geometry._31 = geometry_transform->_31;
+-    cb_data->transform_geometry.pad0 = 0.0f;
+-    cb_data->transform_geometry._12 = geometry_transform->_12;
+-    cb_data->transform_geometry._22 = geometry_transform->_22;
+-    cb_data->transform_geometry._32 = geometry_transform->_32;
+-    cb_data->transform_geometry.stroke_width = stroke_width;
++    if (!(geometry = d2d_device_context_get_cached_geometry(render_target, TRUE, params)))
++        return;
+ 
+-    w = &context->drawing_state.transform;
++    ID2D1DeviceContext6_DrawGeometry(iface, geometry, brush, stroke_width, stroke_style);
++}
+ 
+-    tmp_x = context->desc.dpiX / 96.0f;
+-    cb_data->transform_rtx.x = w->_11 * tmp_x;
+-    cb_data->transform_rtx.y = w->_21 * tmp_x;
+-    cb_data->transform_rtx.z = w->_31 * tmp_x;
+-    cb_data->transform_rtx.w = 2.0f / context->pixel_size.width;
++static void STDMETHODCALLTYPE d2d_device_context_FillEllipse(ID2D1DeviceContext6 *iface,
++        const D2D1_ELLIPSE *ellipse, ID2D1Brush *brush)
++{
++    struct d2d_device_context *render_target = impl_from_ID2D1DeviceContext(iface);
++    ID2D1Geometry *geometry;
++    float params[6] = {ellipse->point.x, ellipse->point.y, ellipse->radiusX, ellipse->radiusY, 0.0f, 0.0f};
+ 
+-    tmp_y = context->desc.dpiY / 96.0f;
+-    cb_data->transform_rty.x = w->_12 * tmp_y;
+-    cb_data->transform_rty.y = w->_22 * tmp_y;
+-    cb_data->transform_rty.z = w->_32 * tmp_y;
+-    cb_data->transform_rty.w = -2.0f / context->pixel_size.height;
++    TRACE("iface %p, ellipse %p, brush %p.\n", iface, ellipse, brush);
+ 
+-    ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->vs_cb, 0);
+-    ID3D11DeviceContext_Release(d3d_context);
++    if (FAILED(render_target->error.code))
++        return;
+ 
+-    return S_OK;
++    if (!(geometry = d2d_device_context_get_cached_geometry(render_target, TRUE, params)))
++        return;
++
++    ID2D1DeviceContext6_FillGeometry(iface, geometry, brush, NULL);
+ }
+ 
+ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_target,
+         const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width)
+ {
+-    D3D11_SUBRESOURCE_DATA buffer_data;
+-    D3D11_BUFFER_DESC buffer_desc;
+     ID3D11Buffer *ib, *vb;
+     HRESULT hr;
+ 
++    if (geometry->outline.face_count && !geometry->outline.bezier_face_count && !geometry->outline.arc_face_count)
++    {
++        if (d2d_device_context_batch_submit(render_target, D2D_SHAPE_TYPE_OUTLINE, &geometry->transform,
++                stroke_width, brush, geometry->outline.vertices, geometry->outline.vertex_count,
++                sizeof(*geometry->outline.vertices), geometry->outline.faces, geometry->outline.face_count))
++            return;
++    }
++
++    d2d_device_context_flush_batch(render_target);
++
+     if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width)))
+     {
+         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
+@@ -871,104 +1401,45 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
+         return;
+     }
+ 
+-    buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+-    buffer_desc.CPUAccessFlags = 0;
+-    buffer_desc.MiscFlags = 0;
+-
+-    buffer_data.SysMemPitch = 0;
+-    buffer_data.SysMemSlicePitch = 0;
+-
+     if (geometry->outline.face_count)
+     {
+-        buffer_desc.ByteWidth = geometry->outline.face_count * sizeof(*geometry->outline.faces);
+-        buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+-        buffer_data.pSysMem = geometry->outline.faces;
+-
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &ib)))
+-        {
+-            WARN("Failed to create index buffer, hr %#lx.\n", hr);
+-            return;
+-        }
+-
+-        buffer_desc.ByteWidth = geometry->outline.vertex_count * sizeof(*geometry->outline.vertices);
+-        buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+-        buffer_data.pSysMem = geometry->outline.vertices;
+-
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
+-        {
+-            ERR("Failed to create vertex buffer, hr %#lx.\n", hr);
+-            ID3D11Buffer_Release(ib);
+-            return;
+-        }
+-
+-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_OUTLINE, ib, 3 * geometry->outline.face_count, vb,
+-                sizeof(*geometry->outline.vertices), brush, NULL);
++        ib = d2d_device_context_get_ib(render_target, geometry->outline.faces,
++                geometry->outline.face_count * sizeof(*geometry->outline.faces));
++        vb = d2d_device_context_get_vb(render_target, geometry->outline.vertices,
++                geometry->outline.vertex_count * sizeof(*geometry->outline.vertices));
+ 
+-        ID3D11Buffer_Release(vb);
+-        ID3D11Buffer_Release(ib);
++        if (ib && vb)
++            d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_OUTLINE, ib, 3 * geometry->outline.face_count, vb,
++                    sizeof(*geometry->outline.vertices), brush, NULL);
+     }
+ 
+     if (geometry->outline.bezier_face_count)
+     {
+-        buffer_desc.ByteWidth = geometry->outline.bezier_face_count * sizeof(*geometry->outline.bezier_faces);
+-        buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+-        buffer_data.pSysMem = geometry->outline.bezier_faces;
+-
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &ib)))
+-        {
+-            WARN("Failed to create curves index buffer, hr %#lx.\n", hr);
+-            return;
+-        }
+-
+-        buffer_desc.ByteWidth = geometry->outline.bezier_count * sizeof(*geometry->outline.beziers);
+-        buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+-        buffer_data.pSysMem = geometry->outline.beziers;
+-
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
+-        {
+-            ERR("Failed to create curves vertex buffer, hr %#lx.\n", hr);
+-            ID3D11Buffer_Release(ib);
+-            return;
+-        }
+-
+-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_BEZIER_OUTLINE, ib,
+-                3 * geometry->outline.bezier_face_count, vb,
+-                sizeof(*geometry->outline.beziers), brush, NULL);
++        ib = d2d_device_context_get_ib(render_target, geometry->outline.bezier_faces,
++                geometry->outline.bezier_face_count * sizeof(*geometry->outline.bezier_faces));
++        vb = d2d_device_context_get_vb(render_target, geometry->outline.beziers,
++                geometry->outline.bezier_count * sizeof(*geometry->outline.beziers));
+ 
+-        ID3D11Buffer_Release(vb);
+-        ID3D11Buffer_Release(ib);
++        if (ib && vb)
++            d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_BEZIER_OUTLINE, ib,
++                    3 * geometry->outline.bezier_face_count, vb,
++                    sizeof(*geometry->outline.beziers), brush, NULL);
+     }
+ 
+     if (geometry->outline.arc_face_count)
+     {
+-        buffer_desc.ByteWidth = geometry->outline.arc_face_count * sizeof(*geometry->outline.arc_faces);
+-        buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+-        buffer_data.pSysMem = geometry->outline.arc_faces;
+-
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &ib)))
+-        {
+-            WARN("Failed to create arcs index buffer, hr %#lx.\n", hr);
+-            return;
+-        }
+-
+-        buffer_desc.ByteWidth = geometry->outline.arc_count * sizeof(*geometry->outline.arcs);
+-        buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+-        buffer_data.pSysMem = geometry->outline.arcs;
++        ib = d2d_device_context_get_ib(render_target, geometry->outline.arc_faces,
++                geometry->outline.arc_face_count * sizeof(*geometry->outline.arc_faces));
++        vb = d2d_device_context_get_vb(render_target, geometry->outline.arcs,
++                geometry->outline.arc_count * sizeof(*geometry->outline.arcs));
+ 
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
++        if (ib && vb)
+         {
+-            ERR("Failed to create arcs vertex buffer, hr %#lx.\n", hr);
+-            ID3D11Buffer_Release(ib);
+-            return;
++            if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, TRUE)))
++                d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_ARC_OUTLINE, ib,
++                        3 * geometry->outline.arc_face_count, vb,
++                        sizeof(*geometry->outline.arcs), brush, NULL);
+         }
+-
+-        if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, TRUE)))
+-            d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_ARC_OUTLINE, ib,
+-                    3 * geometry->outline.arc_face_count, vb,
+-                    sizeof(*geometry->outline.arcs), brush, NULL);
+-
+-        ID3D11Buffer_Release(vb);
+-        ID3D11Buffer_Release(ib);
+     }
+ }
+ 
+@@ -1014,17 +1485,19 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
+ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
+         const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+ {
+-    D3D11_SUBRESOURCE_DATA buffer_data;
+-    D3D11_BUFFER_DESC buffer_desc;
+     ID3D11Buffer *ib, *vb;
+     HRESULT hr;
+ 
+-    buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+-    buffer_desc.CPUAccessFlags = 0;
+-    buffer_desc.MiscFlags = 0;
++    if (!opacity_brush && geometry->fill.face_count
++            && !geometry->fill.bezier_vertex_count && !geometry->fill.arc_vertex_count)
++    {
++        if (d2d_device_context_batch_submit(render_target, D2D_SHAPE_TYPE_TRIANGLE, &geometry->transform,
++                0.0f, brush, geometry->fill.vertices, geometry->fill.vertex_count,
++                sizeof(*geometry->fill.vertices), geometry->fill.faces, geometry->fill.face_count))
++            return;
++    }
+ 
+-    buffer_data.SysMemPitch = 0;
+-    buffer_data.SysMemSlicePitch = 0;
++    d2d_device_context_flush_batch(render_target);
+ 
+     if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f)))
+     {
+@@ -1040,69 +1513,37 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
+ 
+     if (geometry->fill.face_count)
+     {
+-        buffer_desc.ByteWidth = geometry->fill.face_count * sizeof(*geometry->fill.faces);
+-        buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+-        buffer_data.pSysMem = geometry->fill.faces;
+-
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &ib)))
+-        {
+-            WARN("Failed to create index buffer, hr %#lx.\n", hr);
+-            return;
+-        }
+-
+-        buffer_desc.ByteWidth = geometry->fill.vertex_count * sizeof(*geometry->fill.vertices);
+-        buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+-        buffer_data.pSysMem = geometry->fill.vertices;
+-
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
+-        {
+-            ERR("Failed to create vertex buffer, hr %#lx.\n", hr);
+-            ID3D11Buffer_Release(ib);
+-            return;
+-        }
+-
+-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_TRIANGLE, ib, 3 * geometry->fill.face_count, vb,
+-                sizeof(*geometry->fill.vertices), brush, opacity_brush);
++        ib = d2d_device_context_get_ib(render_target, geometry->fill.faces,
++                geometry->fill.face_count * sizeof(*geometry->fill.faces));
++        vb = d2d_device_context_get_vb(render_target, geometry->fill.vertices,
++                geometry->fill.vertex_count * sizeof(*geometry->fill.vertices));
+ 
+-        ID3D11Buffer_Release(vb);
+-        ID3D11Buffer_Release(ib);
++        if (ib && vb)
++            d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_TRIANGLE, ib, 3 * geometry->fill.face_count, vb,
++                    sizeof(*geometry->fill.vertices), brush, opacity_brush);
+     }
+ 
+     if (geometry->fill.bezier_vertex_count)
+     {
+-        buffer_desc.ByteWidth = geometry->fill.bezier_vertex_count * sizeof(*geometry->fill.bezier_vertices);
+-        buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+-        buffer_data.pSysMem = geometry->fill.bezier_vertices;
+-
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
+-        {
+-            ERR("Failed to create curves vertex buffer, hr %#lx.\n", hr);
+-            return;
+-        }
+-
+-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.bezier_vertex_count, vb,
+-                sizeof(*geometry->fill.bezier_vertices), brush, opacity_brush);
++        vb = d2d_device_context_get_vb(render_target, geometry->fill.bezier_vertices,
++                geometry->fill.bezier_vertex_count * sizeof(*geometry->fill.bezier_vertices));
+ 
+-        ID3D11Buffer_Release(vb);
++        if (vb)
++            d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.bezier_vertex_count, vb,
++                    sizeof(*geometry->fill.bezier_vertices), brush, opacity_brush);
+     }
+ 
+     if (geometry->fill.arc_vertex_count)
+     {
+-        buffer_desc.ByteWidth = geometry->fill.arc_vertex_count * sizeof(*geometry->fill.arc_vertices);
+-        buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+-        buffer_data.pSysMem = geometry->fill.arc_vertices;
++        vb = d2d_device_context_get_vb(render_target, geometry->fill.arc_vertices,
++                geometry->fill.arc_vertex_count * sizeof(*geometry->fill.arc_vertices));
+ 
+-        if (FAILED(hr = ID3D11Device1_CreateBuffer(render_target->d3d_device, &buffer_desc, &buffer_data, &vb)))
++        if (vb)
+         {
+-            ERR("Failed to create arc vertex buffer, hr %#lx.\n", hr);
+-            return;
++            if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, TRUE)))
++                d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.arc_vertex_count, vb,
++                        sizeof(*geometry->fill.arc_vertices), brush, opacity_brush);
+         }
+-
+-        if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, TRUE)))
+-            d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.arc_vertex_count, vb,
+-                    sizeof(*geometry->fill.arc_vertices), brush, opacity_brush);
+-
+-        ID3D11Buffer_Release(vb);
+     }
+ }
+ 
+@@ -1424,21 +1865,29 @@ static HRESULT d2d_device_context_get_glyph_run_analysis(struct d2d_device_conte
+         DWRITE_TEXT_ANTIALIAS_MODE antialias_mode, DWRITE_TEXTURE_TYPE *texture_type,
+         IDWriteGlyphRunAnalysis **result)
+ {
++    DWRITE_GLYPH_OFFSET stack_offsets[128], *heap_offsets = NULL;
++    FLOAT stack_advances[128], *heap_advances = NULL;
++    DWRITE_GLYPH_RUN scaled_run = *glyph_run;
+     IDWriteGlyphRunAnalysis *analysis;
+     IDWriteFactory2 *dwrite_factory;
+     D2D1_MATRIX_3X2_F *transform;
+-    float scale_x, scale_y;
++    float scale_x, scale_y, s;
+     DWRITE_MATRIX m;
++    UINT32 i;
+     HRESULT hr;
+ 
+     *result = NULL;
+ 
+-    if (FAILED(hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, &IID_IDWriteFactory2,
+-            (IUnknown **)&dwrite_factory)))
++    if (!context->dwrite_factory)
+     {
+-        ERR("Failed to create dwrite factory, hr %#lx.\n", hr);
+-        return hr;
++        if (FAILED(hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, &IID_IDWriteFactory2,
++                (IUnknown **)&context->dwrite_factory)))
++        {
++            ERR("Failed to create dwrite factory, hr %#lx.\n", hr);
++            return hr;
++        }
+     }
++    dwrite_factory = context->dwrite_factory;
+ 
+     transform = &context->drawing_state.transform;
+ 
+@@ -1452,10 +1901,56 @@ static HRESULT d2d_device_context_get_glyph_run_analysis(struct d2d_device_conte
+     m.m22 = transform->_22 * scale_y;
+     m.dy  = transform->_32 * scale_y;
+ 
+-    hr = IDWriteFactory2_CreateGlyphRunAnalysis(dwrite_factory, glyph_run, &m, rendering_mode,
++    s = hypotf(m.m11, m.m12);
++    if (s > 0.0f && fabsf(s - 1.0f) > 1e-4f)
++    {
++        scaled_run.fontEmSize = max(1.0f, floorf(glyph_run->fontEmSize * s + 0.5f));
++        if (glyph_run->glyphAdvances)
++        {
++            FLOAT *adv = glyph_run->glyphCount <= 128 ? stack_advances
++                    : (heap_advances = malloc(glyph_run->glyphCount * sizeof(FLOAT)));
++            if (adv)
++            {
++                for (i = 0; i < glyph_run->glyphCount; ++i)
++                    adv[i] = glyph_run->glyphAdvances[i] * s;
++                scaled_run.glyphAdvances = adv;
++            }
++        }
++        if (glyph_run->glyphOffsets)
++        {
++            DWRITE_GLYPH_OFFSET *ofs = glyph_run->glyphCount <= 128 ? stack_offsets
++                    : (heap_offsets = malloc(glyph_run->glyphCount * sizeof(DWRITE_GLYPH_OFFSET)));
++            if (ofs)
++            {
++                for (i = 0; i < glyph_run->glyphCount; ++i)
++                {
++                    ofs[i].advanceOffset = glyph_run->glyphOffsets[i].advanceOffset * s;
++                    ofs[i].ascenderOffset = glyph_run->glyphOffsets[i].ascenderOffset * s;
++                }
++                scaled_run.glyphOffsets = ofs;
++            }
++        }
++        baseline_origin.x *= s;
++        baseline_origin.y *= s;
++        m.m11 /= s;
++        m.m12 /= s;
++        m.m21 /= s;
++        m.m22 /= s;
++        if (fabsf(m.m11 - 1.0f) < 1e-3f && fabsf(m.m12) < 1e-3f
++                && fabsf(m.m21) < 1e-3f && fabsf(m.m22 - 1.0f) < 1e-3f)
++        {
++            m.m11 = 1.0f;
++            m.m12 = 0.0f;
++            m.m21 = 0.0f;
++            m.m22 = 1.0f;
++        }
++    }
++
++    hr = IDWriteFactory2_CreateGlyphRunAnalysis(dwrite_factory, &scaled_run, &m, rendering_mode,
+             measuring_mode, DWRITE_GRID_FIT_MODE_DEFAULT, antialias_mode, baseline_origin.x,
+             baseline_origin.y, &analysis);
+-    IDWriteFactory2_Release(dwrite_factory);
++    free(heap_advances);
++    free(heap_offsets);
+     if (FAILED(hr))
+     {
+         ERR("Failed to create glyph run analysis, hr %#lx.\n", hr);
+@@ -1472,118 +1967,276 @@ static HRESULT d2d_device_context_get_glyph_run_analysis(struct d2d_device_conte
+     return S_OK;
+ }
+ 
++static uint32_t d2d_hash_bytes(uint32_t hash, const void *data, size_t size)
++{
++    const uint8_t *p = data;
++    size_t i;
++
++    for (i = 0; i < size; ++i)
++        hash = (hash ^ p[i]) * 16777619u;
++    return hash;
++}
++
+ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *context,
+         D2D1_POINT_2F baseline_origin, const DWRITE_GLYPH_RUN *glyph_run, ID2D1Brush *brush,
+         DWRITE_RENDERING_MODE rendering_mode, DWRITE_MEASURING_MODE measuring_mode,
+         DWRITE_TEXT_ANTIALIAS_MODE antialias_mode)
+ {
+-    ID2D1RectangleGeometry *geometry = NULL;
++    struct d2d_brush *brush_impl = unsafe_impl_from_ID2D1Brush(brush);
++    struct d2d_glyph_cache_entry *hit = NULL, *target = NULL;
++    struct d2d_brush *opacity_brush_impl;
+     ID2D1BitmapBrush *opacity_brush = NULL;
+     D2D1_BITMAP_PROPERTIES bitmap_desc;
+     ID2D1Bitmap *opacity_bitmap = NULL;
+-    IDWriteGlyphRunAnalysis *analysis;
++    IDWriteGlyphRunAnalysis *analysis = NULL;
+     DWRITE_TEXTURE_TYPE texture_type;
+     D2D1_BRUSH_PROPERTIES brush_desc;
+-    D2D1_MATRIX_3X2_F *transform, m;
++    D2D1_MATRIX_3X2_F *transform, saved_transform;
+     void *opacity_values = NULL;
+     size_t opacity_values_size;
+     D2D1_SIZE_U bitmap_size;
+-    float scale_x, scale_y;
++    float scale_x, scale_y, m11, m12, m21, m22, tx, ty;
+     D2D1_RECT_F run_rect;
++    D2D1_POINT_2F vtx[4];
++    ID3D11Buffer *vb;
++    uint32_t hash = 2166136261u;
++    unsigned int step, idx;
+     RECT bounds;
+     HRESULT hr;
+ 
+-    hr = d2d_device_context_get_glyph_run_analysis(context, baseline_origin, glyph_run,
+-            rendering_mode, measuring_mode, antialias_mode, &texture_type, &analysis);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to create glyph run analysis, hr %#lx.\n", hr);
++    if (!glyph_run || !glyph_run->glyphCount || !glyph_run->fontFace || !glyph_run->glyphIndices)
+         return;
+-    }
+ 
+-    if (FAILED(hr = IDWriteGlyphRunAnalysis_GetAlphaTextureBounds(analysis, texture_type, &bounds)))
+-    {
+-        ERR("Failed to get alpha texture bounds, hr %#lx.\n", hr);
+-        goto done;
+-    }
++    transform = &context->drawing_state.transform;
++    scale_x = context->desc.dpiX / 96.0f;
++    scale_y = context->desc.dpiY / 96.0f;
++    m11 = transform->_11 * scale_x;
++    m21 = transform->_21 * scale_x;
++    m12 = transform->_12 * scale_y;
++    m22 = transform->_22 * scale_y;
+ 
+-    d2d_size_set(&bitmap_size, bounds.right - bounds.left, bounds.bottom - bounds.top);
+-    if (!bitmap_size.width || !bitmap_size.height)
+-    {
+-        /* Empty run, nothing to do. */
+-        goto done;
+-    }
++    if (glyph_run->fontEmSize * hypotf(m11, m12) < 1.0f)
++        return;
+ 
+-    if (texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1)
+-        bitmap_size.width *= 3;
+-    if (!(opacity_values = calloc(bitmap_size.height, bitmap_size.width)))
+-    {
+-        ERR("Failed to allocate opacity values.\n");
+-        goto done;
++    tx = floorf((baseline_origin.x * m11 + baseline_origin.y * m21 + transform->_31 * scale_x) + 0.5f);
++    ty = floorf((baseline_origin.x * m12 + baseline_origin.y * m22 + transform->_32 * scale_y) + 0.5f);
++
++    hash = d2d_hash_bytes(hash, &glyph_run->fontFace, sizeof(glyph_run->fontFace));
++    hash = d2d_hash_bytes(hash, &glyph_run->fontEmSize, sizeof(glyph_run->fontEmSize));
++    hash = d2d_hash_bytes(hash, &m11, sizeof(m11));
++    hash = d2d_hash_bytes(hash, &m12, sizeof(m12));
++    hash = d2d_hash_bytes(hash, &m21, sizeof(m21));
++    hash = d2d_hash_bytes(hash, &m22, sizeof(m22));
++    hash = d2d_hash_bytes(hash, &rendering_mode, sizeof(rendering_mode));
++    hash = d2d_hash_bytes(hash, &measuring_mode, sizeof(measuring_mode));
++    hash = d2d_hash_bytes(hash, &antialias_mode, sizeof(antialias_mode));
++    hash = d2d_hash_bytes(hash, &glyph_run->glyphCount, sizeof(glyph_run->glyphCount));
++    hash = d2d_hash_bytes(hash, &glyph_run->isSideways, sizeof(glyph_run->isSideways));
++    hash = d2d_hash_bytes(hash, &glyph_run->bidiLevel, sizeof(glyph_run->bidiLevel));
++    hash = d2d_hash_bytes(hash, glyph_run->glyphIndices, glyph_run->glyphCount * sizeof(UINT16));
++    if (glyph_run->glyphAdvances)
++        hash = d2d_hash_bytes(hash, glyph_run->glyphAdvances, glyph_run->glyphCount * sizeof(FLOAT));
++    if (glyph_run->glyphOffsets)
++        hash = d2d_hash_bytes(hash, glyph_run->glyphOffsets, glyph_run->glyphCount * sizeof(DWRITE_GLYPH_OFFSET));
++
++    for (step = 0; step < 8; ++step)
++    {
++        struct d2d_glyph_cache_entry *e = &context->glyph_cache[(hash + step) & (D2D_GLYPH_CACHE_SIZE - 1)];
++        if (e->valid)
++        {
++            if (e->hash == hash
++                    && e->font_face == glyph_run->fontFace
++                    && e->em_size == glyph_run->fontEmSize
++                    && e->m11 == m11 && e->m12 == m12 && e->m21 == m21 && e->m22 == m22
++                    && e->rendering_mode == rendering_mode
++                    && e->measuring_mode == measuring_mode
++                    && e->antialias_mode == antialias_mode
++                    && e->glyph_count == glyph_run->glyphCount
++                    && e->is_sideways == glyph_run->isSideways
++                    && e->bidi_level == glyph_run->bidiLevel
++                    && !memcmp(e->glyph_indices, glyph_run->glyphIndices, glyph_run->glyphCount * sizeof(UINT16))
++                    && (!e->glyph_advances == !glyph_run->glyphAdvances)
++                    && (!glyph_run->glyphAdvances || !memcmp(e->glyph_advances, glyph_run->glyphAdvances,
++                            glyph_run->glyphCount * sizeof(FLOAT)))
++                    && (!e->glyph_offsets == !glyph_run->glyphOffsets)
++                    && (!glyph_run->glyphOffsets || !memcmp(e->glyph_offsets, glyph_run->glyphOffsets,
++                            glyph_run->glyphCount * sizeof(DWRITE_GLYPH_OFFSET))))
++            {
++                hit = e;
++                break;
++            }
++        }
++        else if (!target)
++        {
++            target = e;
++        }
+     }
+-    opacity_values_size = bitmap_size.height * bitmap_size.width;
+ 
+-    if (FAILED(hr = IDWriteGlyphRunAnalysis_CreateAlphaTexture(analysis,
+-            texture_type, &bounds, opacity_values, opacity_values_size)))
++    if (!hit)
+     {
+-        ERR("Failed to create alpha texture, hr %#lx.\n", hr);
+-        goto done;
+-    }
++        D2D1_POINT_2F zero_origin = {0.0f, 0.0f};
++        float saved_dx = transform->_31, saved_dy = transform->_32;
+ 
+-    bitmap_desc.pixelFormat.format = DXGI_FORMAT_A8_UNORM;
+-    bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+-    bitmap_desc.dpiX = context->desc.dpiX;
+-    if (texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1)
+-        bitmap_desc.dpiX *= 3.0f;
+-    bitmap_desc.dpiY = context->desc.dpiY;
+-    if (FAILED(hr = d2d_device_context_CreateBitmap(&context->ID2D1DeviceContext6_iface,
+-            bitmap_size, opacity_values, bitmap_size.width, &bitmap_desc, &opacity_bitmap)))
+-    {
+-        ERR("Failed to create opacity bitmap, hr %#lx.\n", hr);
+-        goto done;
+-    }
++        transform->_31 = 0.0f;
++        transform->_32 = 0.0f;
++        hr = d2d_device_context_get_glyph_run_analysis(context, zero_origin, glyph_run,
++                rendering_mode, measuring_mode, antialias_mode, &texture_type, &analysis);
++        transform->_31 = saved_dx;
++        transform->_32 = saved_dy;
+ 
+-    scale_x = context->desc.dpiX / 96.0f;
+-    scale_y = context->desc.dpiY / 96.0f;
+-    d2d_rect_set(&run_rect, bounds.left / scale_x, bounds.top / scale_y,
+-            bounds.right / scale_x, bounds.bottom / scale_y);
++        if (FAILED(hr))
++        {
++            ERR("Failed to create glyph run analysis, hr %#lx.\n", hr);
++            return;
++        }
+ 
+-    brush_desc.opacity = 1.0f;
+-    brush_desc.transform._11 = 1.0f;
+-    brush_desc.transform._12 = 0.0f;
+-    brush_desc.transform._21 = 0.0f;
+-    brush_desc.transform._22 = 1.0f;
+-    brush_desc.transform._31 = run_rect.left;
+-    brush_desc.transform._32 = run_rect.top;
+-    if (FAILED(hr = d2d_device_context_CreateBitmapBrush(&context->ID2D1DeviceContext6_iface,
+-            opacity_bitmap, NULL, &brush_desc, &opacity_brush)))
+-    {
+-        ERR("Failed to create opacity bitmap brush, hr %#lx.\n", hr);
+-        goto done;
+-    }
++        if (FAILED(hr = IDWriteGlyphRunAnalysis_GetAlphaTextureBounds(analysis, texture_type, &bounds)))
++        {
++            ERR("Failed to get alpha texture bounds, hr %#lx.\n", hr);
++            IDWriteGlyphRunAnalysis_Release(analysis);
++            return;
++        }
+ 
+-    if (FAILED(hr = ID2D1Factory_CreateRectangleGeometry(context->factory, &run_rect, &geometry)))
+-    {
+-        ERR("Failed to create geometry, hr %#lx.\n", hr);
+-        goto done;
+-    }
++        d2d_size_set(&bitmap_size, bounds.right - bounds.left, bounds.bottom - bounds.top);
++        if (bitmap_size.width && bitmap_size.height)
++        {
++            if (texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1)
++                bitmap_size.width *= 3;
++            if (!(opacity_values = calloc(bitmap_size.height, bitmap_size.width)))
++            {
++                ERR("Failed to allocate opacity values.\n");
++                IDWriteGlyphRunAnalysis_Release(analysis);
++                return;
++            }
++            opacity_values_size = bitmap_size.height * bitmap_size.width;
+ 
+-    transform = &context->drawing_state.transform;
+-    m = *transform;
++            if (FAILED(hr = IDWriteGlyphRunAnalysis_CreateAlphaTexture(analysis,
++                    texture_type, &bounds, opacity_values, opacity_values_size)))
++            {
++                ERR("Failed to create alpha texture, hr %#lx.\n", hr);
++                free(opacity_values);
++                IDWriteGlyphRunAnalysis_Release(analysis);
++                return;
++            }
++
++            bitmap_desc.pixelFormat.format = DXGI_FORMAT_A8_UNORM;
++            bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
++            bitmap_desc.dpiX = context->desc.dpiX;
++            if (texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1)
++                bitmap_desc.dpiX *= 3.0f;
++            bitmap_desc.dpiY = context->desc.dpiY;
++            if (FAILED(hr = d2d_device_context_CreateBitmap(&context->ID2D1DeviceContext6_iface,
++                    bitmap_size, opacity_values, bitmap_size.width, &bitmap_desc, &opacity_bitmap)))
++            {
++                ERR("Failed to create opacity bitmap, hr %#lx.\n", hr);
++                free(opacity_values);
++                IDWriteGlyphRunAnalysis_Release(analysis);
++                return;
++            }
++            free(opacity_values);
++            opacity_values = NULL;
++
++            brush_desc.opacity = 1.0f;
++            brush_desc.transform._11 = 1.0f;
++            brush_desc.transform._12 = 0.0f;
++            brush_desc.transform._21 = 0.0f;
++            brush_desc.transform._22 = 1.0f;
++            brush_desc.transform._31 = 0.0f;
++            brush_desc.transform._32 = 0.0f;
++            if (FAILED(hr = d2d_device_context_CreateBitmapBrush(&context->ID2D1DeviceContext6_iface,
++                    opacity_bitmap, NULL, &brush_desc, &opacity_brush)))
++            {
++                ERR("Failed to create opacity bitmap brush, hr %#lx.\n", hr);
++                ID2D1Bitmap_Release(opacity_bitmap);
++                IDWriteGlyphRunAnalysis_Release(analysis);
++                return;
++            }
++        }
++        IDWriteGlyphRunAnalysis_Release(analysis);
++
++        if (!target)
++        {
++            idx = (hash + (context->glyph_cache_clock++ & 7)) & (D2D_GLYPH_CACHE_SIZE - 1);
++            target = &context->glyph_cache[idx];
++            d2d_glyph_cache_entry_clear(target);
++        }
++
++        target->glyph_indices = malloc(glyph_run->glyphCount * sizeof(UINT16));
++        if (!target->glyph_indices)
++        {
++            if (opacity_brush) ID2D1BitmapBrush_Release(opacity_brush);
++            if (opacity_bitmap) ID2D1Bitmap_Release(opacity_bitmap);
++            return;
++        }
++        memcpy(target->glyph_indices, glyph_run->glyphIndices, glyph_run->glyphCount * sizeof(UINT16));
++
++        if (glyph_run->glyphAdvances)
++        {
++            if ((target->glyph_advances = malloc(glyph_run->glyphCount * sizeof(FLOAT))))
++                memcpy(target->glyph_advances, glyph_run->glyphAdvances, glyph_run->glyphCount * sizeof(FLOAT));
++        }
++        if (glyph_run->glyphOffsets)
++        {
++            if ((target->glyph_offsets = malloc(glyph_run->glyphCount * sizeof(DWRITE_GLYPH_OFFSET))))
++                memcpy(target->glyph_offsets, glyph_run->glyphOffsets,
++                        glyph_run->glyphCount * sizeof(DWRITE_GLYPH_OFFSET));
++        }
++
++        target->hash = hash;
++        target->font_face = glyph_run->fontFace;
++        IDWriteFontFace_AddRef(target->font_face);
++        target->em_size = glyph_run->fontEmSize;
++        target->m11 = m11;
++        target->m12 = m12;
++        target->m21 = m21;
++        target->m22 = m22;
++        target->rendering_mode = rendering_mode;
++        target->measuring_mode = measuring_mode;
++        target->antialias_mode = antialias_mode;
++        target->glyph_count = glyph_run->glyphCount;
++        target->is_sideways = glyph_run->isSideways;
++        target->bidi_level = glyph_run->bidiLevel;
++        target->opacity_bitmap = opacity_bitmap;
++        target->opacity_brush = opacity_brush;
++        target->bounds = bounds;
++        target->empty = (!bitmap_size.width || !bitmap_size.height);
++        target->valid = TRUE;
++        hit = target;
++    }
++
++    if (hit->empty)
++        return;
++
++    d2d_rect_set(&run_rect,
++            (hit->bounds.left + tx) / scale_x,
++            (hit->bounds.top + ty) / scale_y,
++            (hit->bounds.right + tx) / scale_x,
++            (hit->bounds.bottom + ty) / scale_y);
++
++    opacity_brush_impl = unsafe_impl_from_ID2D1Brush((ID2D1Brush *)hit->opacity_brush);
++    opacity_brush_impl->transform._31 = run_rect.left;
++    opacity_brush_impl->transform._32 = run_rect.top;
++
++    d2d_device_context_flush_batch(context);
++
++    saved_transform = *transform;
+     *transform = identity;
+-    d2d_device_context_fill_geometry(context, unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry),
+-            unsafe_impl_from_ID2D1Brush(brush), unsafe_impl_from_ID2D1Brush((ID2D1Brush *)opacity_brush));
+-    *transform = m;
++    hr = d2d_device_context_update_vs_cb(context, &identity, 0.0f);
++    *transform = saved_transform;
++    if (FAILED(hr))
++        return;
+ 
+-done:
+-    if (geometry)
+-        ID2D1RectangleGeometry_Release(geometry);
+-    if (opacity_brush)
+-        ID2D1BitmapBrush_Release(opacity_brush);
+-    if (opacity_bitmap)
+-        ID2D1Bitmap_Release(opacity_bitmap);
+-    free(opacity_values);
+-    IDWriteGlyphRunAnalysis_Release(analysis);
++    if (FAILED(d2d_device_context_update_ps_cb(context, brush_impl, opacity_brush_impl, FALSE, FALSE)))
++        return;
++
++    vtx[0].x = run_rect.left;  vtx[0].y = run_rect.top;
++    vtx[1].x = run_rect.left;  vtx[1].y = run_rect.bottom;
++    vtx[2].x = run_rect.right; vtx[2].y = run_rect.top;
++    vtx[3].x = run_rect.right; vtx[3].y = run_rect.bottom;
++
++    if ((vb = d2d_device_context_get_vb(context, vtx, sizeof(vtx))))
++        d2d_device_context_draw(context, D2D_SHAPE_TYPE_TRIANGLE, context->ib, 6, vb,
++                sizeof(*vtx), brush_impl, opacity_brush_impl);
+ }
+ 
+ static HRESULT d2d_device_context_get_text_rendering_mode(struct d2d_device_context *context,
+@@ -1591,6 +2244,7 @@ static HRESULT d2d_device_context_get_text_rendering_mode(struct d2d_device_cont
+         DWRITE_TEXT_ANTIALIAS_MODE *antialias_mode, DWRITE_RENDERING_MODE *rendering_mode)
+ {
+     IDWriteRenderingParams *rendering_params;
++    float scale, eff_em_size;
+     HRESULT hr = S_OK;
+ 
+     rendering_params = context->text_rendering_params ? context->text_rendering_params
+@@ -1650,12 +2304,14 @@ static HRESULT d2d_device_context_get_text_rendering_mode(struct d2d_device_cont
+ 
+     if (*rendering_mode == DWRITE_RENDERING_MODE_DEFAULT)
+     {
+-        if (FAILED(hr = IDWriteFontFace_GetRecommendedRenderingMode(glyph_run->fontFace, glyph_run->fontEmSize,
++        scale = hypotf(context->drawing_state.transform._11, context->drawing_state.transform._12);
++        eff_em_size = scale > 0.0f ? max(1.0f, glyph_run->fontEmSize * scale) : glyph_run->fontEmSize;
++        if (FAILED(hr = IDWriteFontFace_GetRecommendedRenderingMode(glyph_run->fontFace, eff_em_size,
+                 max(context->desc.dpiX, context->desc.dpiY) / 96.0f,
+                 measuring_mode, rendering_params, rendering_mode)))
+         {
+             ERR("Failed to get recommended rendering mode, hr %#lx.\n", hr);
+-            *rendering_mode = DWRITE_RENDERING_MODE_OUTLINE;
++            *rendering_mode = DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC;
+         }
+     }
+ 
+@@ -1694,10 +2350,10 @@ static void d2d_device_context_draw_glyph_run(struct d2d_device_context *context
+     }
+ 
+     if (rendering_mode == DWRITE_RENDERING_MODE_OUTLINE)
+-        d2d_device_context_draw_glyph_run_outline(context, baseline_origin, glyph_run, brush);
+-    else
+-        d2d_device_context_draw_glyph_run_bitmap(context, baseline_origin, glyph_run, brush,
+-                rendering_mode, measuring_mode, antialias_mode);
++        rendering_mode = DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC;
++
++    d2d_device_context_draw_glyph_run_bitmap(context, baseline_origin, glyph_run, brush,
++            rendering_mode, measuring_mode, antialias_mode);
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_DrawGlyphRun(ID2D1DeviceContext6 *iface,
+@@ -1860,8 +2516,16 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_Flush(ID2D1DeviceContext6 *iface, D2D1_TAG *tag1, D2D1_TAG *tag2)
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    ID3D11DeviceContext *d3d_context;
++
++    TRACE("iface %p, tag1 %p, tag2 %p.\n", iface, tag1, tag2);
++
++    d2d_device_context_flush_batch(context);
++    d2d_device_context_leave_d3d_state(context);
+ 
+-    FIXME("iface %p, tag1 %p, tag2 %p stub!\n", iface, tag1, tag2);
++    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
++    ID3D11DeviceContext_Flush(d3d_context);
++    ID3D11DeviceContext_Release(d3d_context);
+ 
+     if (context->ops && context->ops->device_context_present)
+         context->ops->device_context_present(context->outer_unknown);
+@@ -1948,6 +2612,8 @@ static void STDMETHODCALLTYPE d2d_device_context_PushAxisAlignedClip(ID2D1Device
+             clip_rect->right * x_scale, clip_rect->bottom * y_scale);
+     d2d_rect_expand(&transformed_rect, &point);
+ 
++    d2d_device_context_flush_batch(context);
++
+     if (!d2d_clip_stack_push(&context->clip_stack, &transformed_rect))
+         WARN("Failed to push clip rect.\n");
+ }
+@@ -1961,6 +2627,8 @@ static void STDMETHODCALLTYPE d2d_device_context_PopAxisAlignedClip(ID2D1DeviceC
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+         d2d_command_list_pop_clip(context->target.command_list);
+ 
++    d2d_device_context_flush_batch(context);
++
+     d2d_clip_stack_pop(&context->clip_stack);
+ }
+ 
+@@ -1991,6 +2659,8 @@ static void STDMETHODCALLTYPE d2d_device_context_Clear(ID2D1DeviceContext6 *ifac
+         return;
+     }
+ 
++    d2d_device_context_flush_batch(context);
++
+     ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+ 
+     if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)context->vs_cb,
+@@ -2081,11 +2751,21 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_EndDraw(ID2D1DeviceContext6
+     if (tag2)
+         *tag2 = context->error.tag2;
+ 
++    d2d_device_context_flush_batch(context);
++    d2d_device_context_leave_d3d_state(context);
++
+     if (context->ops && context->ops->device_context_present)
+     {
+         if (FAILED(hr = context->ops->device_context_present(context->outer_unknown)))
+             context->error.code = hr;
+     }
++    else
++    {
++        ID3D11DeviceContext *d3d_context;
++        ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
++        ID3D11DeviceContext_Flush(d3d_context);
++        ID3D11DeviceContext_Release(d3d_context);
++    }
+ 
+     return context->error.code;
+ }
+@@ -2544,6 +3224,9 @@ static void d2d_device_context_reset_target(struct d2d_device_context *context)
+     if (!context->target.object)
+         return;
+ 
++    d2d_device_context_flush_batch(context);
++    d2d_device_context_leave_d3d_state(context);
++
+     IUnknown_Release(context->target.object);
+     memset(&context->target, 0, sizeof(context->target));
+ 
+@@ -2939,6 +3622,11 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometryRealization(ID2D1De
+         }
+         return;
+     }
++
++    if (r->filled)
++        ID2D1DeviceContext6_FillGeometry(iface, r->geometry, brush, NULL);
++    else
++        ID2D1DeviceContext6_DrawGeometry(iface, r->geometry, brush, r->stroke_width, r->stroke_style);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateInk(ID2D1DeviceContext6 *iface,
+@@ -3691,6 +4379,9 @@ static HRESULT STDMETHODCALLTYPE d2d_gdi_interop_render_target_GetDC(ID2D1GdiInt
+     if (render_target->target.hdc)
+         return D2DERR_WRONG_STATE;
+ 
++    d2d_device_context_flush_batch(render_target);
++    d2d_device_context_leave_d3d_state(render_target);
++
+     if (FAILED(hr = d2d_gdi_interop_get_surface(render_target, &surface)))
+         return hr;
+ 
+@@ -4420,6 +5111,12 @@ static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
+     return S_OK;
+ 
+ err:
++    if (render_target->dynamic_vb)
++        ID3D11Buffer_Release(render_target->dynamic_vb);
++    if (render_target->dynamic_ib)
++        ID3D11Buffer_Release(render_target->dynamic_ib);
++    if (render_target->dwrite_factory)
++        IDWriteFactory2_Release(render_target->dwrite_factory);
+     if (render_target->default_text_rendering_params)
+         IDWriteRenderingParams_Release(render_target->default_text_rendering_params);
+     if (render_target->rs)
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index b6903d0..04add72 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3527,6 +3527,12 @@ static BOOL d2d_geometry_check_bezier_overlap(struct d2d_geometry *geometry,
+     b[1] = &figure->bezier_controls[idx_q->control_idx];
+     b[2] = &figure->vertices[idx_q->vertex_idx + 1];
+ 
++    if (max(a[0]->x, max(a[1]->x, a[2]->x)) <= min(b[0]->x, min(b[1]->x, b[2]->x))
++            || min(a[0]->x, min(a[1]->x, a[2]->x)) >= max(b[0]->x, max(b[1]->x, b[2]->x))
++            || max(a[0]->y, max(a[1]->y, a[2]->y)) <= min(b[0]->y, min(b[1]->y, b[2]->y))
++            || min(a[0]->y, min(a[1]->y, a[2]->y)) >= max(b[0]->y, max(b[1]->y, b[2]->y)))
++        return FALSE;
++
+     if (d2d_point_ccw(a[0], a[1], a[2]) == 0.0f || d2d_point_ccw(b[0], b[1], b[2]) == 0.0f)
+         return FALSE;
+ 
+diff --git a/dlls/win32u/bitblt.c b/dlls/win32u/bitblt.c
+index c6021dd..92d0cc8 100644
+--- a/dlls/win32u/bitblt.c
++++ b/dlls/win32u/bitblt.c
+@@ -32,6 +32,7 @@
+ #include "wingdi.h"
+ #include "ntgdi_private.h"
+ #include "wine/debug.h"
++#include "gdi_perf.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(bitblt);
+ 
+@@ -285,6 +286,9 @@ BOOL nulldrv_StretchBlt( PHYSDEV dst_dev, struct bitblt_coords *dst,
+     DWORD err;
+     struct gdi_image_bits bits;
+ 
++    unsigned long long start_ns = get_time_ns();
++    g_gdi_stats.bitblts++;
++
+     src_dev = GET_DC_PHYSDEV( dc_src, pGetImage );
+     if (src_dev->funcs->pGetImage( src_dev, src_info, &bits, src ))
+         return FALSE;
+@@ -322,6 +326,7 @@ BOOL nulldrv_StretchBlt( PHYSDEV dst_dev, struct bitblt_coords *dst,
+     }
+ 
+     if (bits.free) bits.free( &bits );
++    record_gdi_time( start_ns );
+     return !err;
+ }
+ 
+@@ -337,6 +342,9 @@ BOOL nulldrv_AlphaBlend( PHYSDEV dst_dev, struct bitblt_coords *dst,
+     DWORD err;
+     struct gdi_image_bits bits;
+ 
++    unsigned long long start_ns = get_time_ns();
++    g_gdi_stats.bitblts++;
++
+     src_dev = GET_DC_PHYSDEV( dc_src, pGetImage );
+     err = src_dev->funcs->pGetImage( src_dev, src_info, &bits, src );
+     if (err) goto done;
+@@ -360,6 +368,7 @@ BOOL nulldrv_AlphaBlend( PHYSDEV dst_dev, struct bitblt_coords *dst,
+ 
+     if (bits.free) bits.free( &bits );
+ done:
++    record_gdi_time( start_ns );
+     if (err) RtlSetLastWin32Error( err );
+     return !err;
+ }
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 67d3dc8..e544473 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -31,6 +31,7 @@
+ #include "wine/opengl_driver.h"
+ #include "wine/server.h"
+ #include "wine/debug.h"
++#include "gdi_perf.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(win);
+ 
+@@ -624,6 +625,14 @@ void window_surface_flush( struct window_surface *surface )
+ 
+     window_surface_lock( surface );
+ 
++    if (IsRectEmpty( &surface->bounds ))
++    {
++        window_surface_unlock( surface );
++        return;
++    }
++
++    surface->draw_start_ticks = 0;
++
+     /* align bounds / dirty rect to help with 1bpp shape bitmap updates */
+     bounds.left = surface->bounds.left & ~7;
+     bounds.top = surface->bounds.top;
+@@ -637,12 +646,16 @@ void window_surface_flush( struct window_surface *surface )
+         BOOL shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits );
+         void *shape_bits = window_surface_get_shape( surface, shape_info );
+ 
++        unsigned long long flush_t0;
++
+         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
+                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
+ 
++        flush_t0 = get_time_ns();
+         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
+                                    shape_changed, shape_info, shape_bits ))
+             reset_bounds( &surface->bounds );
++        g_gdi_stats.flush_ns += (get_time_ns() - flush_t0);
+     }
+ 
+     window_surface_unlock( surface );
+@@ -746,6 +759,7 @@ void register_window_surface( struct window_surface *old, struct window_surface
+     if (old) list_remove( &old->entry );
+     if (new) list_add_tail( &window_surfaces, &new->entry );
+     pthread_mutex_unlock( &surfaces_lock );
++    g_any_surface_dirty = 1;
+ }
+ 
+ /*******************************************************************
+@@ -753,21 +767,46 @@ void register_window_surface( struct window_surface *old, struct window_surface
+  *
+  * Flush pending output from all window surfaces.
+  */
++volatile LONG g_any_surface_dirty = 1;
++
++void flush_window_surfaces_force(void)
++{
++    struct window_surface *surface;
++
++    if (!g_any_surface_dirty) return;
++
++    pthread_mutex_lock( &surfaces_lock );
++    g_any_surface_dirty = 0;
++    LIST_FOR_EACH_ENTRY( surface, &window_surfaces, struct window_surface, entry )
++    {
++        g_gdi_stats.flushes++;
++        window_surface_flush( surface );
++    }
++    pthread_mutex_unlock( &surfaces_lock );
++}
++
+ void flush_window_surfaces( BOOL idle )
+ {
+-    static DWORD last_idle;
++    static DWORD last_flush;
+     DWORD now;
+     struct window_surface *surface;
+ 
+-    pthread_mutex_lock( &surfaces_lock );
++    if (!g_any_surface_dirty) return;
++
+     now = NtGetTickCount();
+-    if (idle) last_idle = now;
+-    /* if not idle, we only flush if there's evidence that the app never goes idle */
+-    else if ((int)(now - last_idle) < 50) goto done;
++    if (!idle && (int)(now - last_flush) < 16)
++    {
++        return;
++    }
+ 
++    pthread_mutex_lock( &surfaces_lock );
++    last_flush = now;
++    g_any_surface_dirty = 0;
+     LIST_FOR_EACH_ENTRY( surface, &window_surfaces, struct window_surface, entry )
++    {
++        g_gdi_stats.flushes++;
+         window_surface_flush( surface );
+-done:
++    }
+     pthread_mutex_unlock( &surfaces_lock );
+ }
+ 
+@@ -1716,6 +1755,7 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
+     UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_NOCHILDREN;
+ 
+     NtUserHideCaret( hwnd );
++    g_paint_start_ns = get_time_ns();
+ 
+     if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) return 0;
+ 
+@@ -1739,8 +1779,15 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
+  */
+ BOOL WINAPI NtUserEndPaint( HWND hwnd, const PAINTSTRUCT *ps )
+ {
++    g_gdi_stats.endpaints++;
++    if (g_paint_start_ns)
++    {
++        g_gdi_stats.paint_app_ns += (get_time_ns() - g_paint_start_ns);
++        g_paint_start_ns = 0;
++    }
+     NtUserShowCaret( hwnd );
+-    flush_window_surfaces( FALSE );
++    flush_window_surfaces_force();
++    record_gdi_time( get_time_ns() );
+     if (!ps) return FALSE;
+     release_dc( hwnd, ps->hdc, TRUE );
+     return TRUE;
+@@ -1810,6 +1857,8 @@ BOOL WINAPI NtUserRedrawWindow( HWND hwnd, const RECT *rect, HRGN hrgn, UINT fla
+     static const RECT empty;
+     BOOL ret;
+ 
++    if (flags & RDW_INVALIDATE) g_gdi_stats.invalidates++;
++
+     if (TRACE_ON(win))
+     {
+         if (hrgn)
+diff --git a/dlls/win32u/dibdrv/dc.c b/dlls/win32u/dibdrv/dc.c
+index 8a72d97..984b28e 100644
+--- a/dlls/win32u/dibdrv/dc.c
++++ b/dlls/win32u/dibdrv/dc.c
+@@ -496,7 +496,7 @@ const struct gdi_dc_funcs dib_driver =
+  * can paint to the same window.
+  */
+ 
+-#define FLUSH_PERIOD 50  /* time in ms since drawing started for forcing a surface flush */
++#define FLUSH_PERIOD 16  /* time in ms since drawing started for forcing a surface flush */
+ 
+ struct windrv_physdev
+ {
+@@ -521,6 +521,7 @@ static inline void lock_surface( struct windrv_physdev *dev )
+     if (!dev->lock_count++)
+     {
+         window_surface_lock( surface );
++        g_any_surface_dirty = 1;
+         if (IsRectEmpty( dev->dibdrv->bounds ) || !surface->draw_start_ticks)
+             surface->draw_start_ticks = NtGetTickCount();
+     }
+@@ -534,7 +535,11 @@ static inline void unlock_surface( struct windrv_physdev *dev )
+     {
+         DWORD ticks = NtGetTickCount() - surface->draw_start_ticks;
+         window_surface_unlock( surface );
+-        if (ticks > FLUSH_PERIOD) window_surface_flush( dev->surface );
++        if (ticks > FLUSH_PERIOD)
++        {
++            surface->draw_start_ticks = 0;
++            window_surface_flush( dev->surface );
++        }
+     }
+ }
+ 
+diff --git a/dlls/win32u/dibdrv/graphics.c b/dlls/win32u/dibdrv/graphics.c
+index 92dea91..9430e3b 100644
+--- a/dlls/win32u/dibdrv/graphics.c
++++ b/dlls/win32u/dibdrv/graphics.c
+@@ -28,6 +28,7 @@
+ #include "dibdrv.h"
+ 
+ #include "wine/debug.h"
++#include "../gdi_perf.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dib);
+ 
+@@ -897,11 +898,14 @@ BOOL render_aa_text_bitmapinfo( DC *dc, BITMAPINFO *info, struct gdi_image_bits
+ BOOL dibdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
+                         const RECT *rect, LPCWSTR str, UINT count, const INT *dx )
+ {
++    unsigned long long start_ns = get_time_ns();
+     dibdrv_physdev *pdev = get_dibdrv_pdev(dev);
+     DC *dc = get_physdev_dc( dev );
+     struct clipped_rects clipped_rects;
+     RECT bounds;
+ 
++    g_gdi_stats.texts++;
++
+     if (!pdev->font) return FALSE;
+ 
+     init_clipped_rects( &clipped_rects );
+@@ -937,6 +941,7 @@ BOOL dibdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
+ done:
+     add_clipped_bounds( pdev, &bounds, pdev->clip );
+     free_clipped_rects( &clipped_rects );
++    record_gdi_time( start_ns );
+     return TRUE;
+ }
+ 
+@@ -1246,6 +1251,7 @@ BOOL dibdrv_PaintRgn( PHYSDEV dev, HRGN rgn )
+  */
+ BOOL dibdrv_PolyPolygon( PHYSDEV dev, const POINT *pt, const INT *counts, UINT polygons )
+ {
++    unsigned long long start_ns = get_time_ns();
+     dibdrv_physdev *pdev = get_dibdrv_pdev(dev);
+     DC *dc = get_physdev_dc( dev );
+     DWORD total, i, pos;
+@@ -1255,6 +1261,8 @@ BOOL dibdrv_PolyPolygon( PHYSDEV dev, const POINT *pt, const INT *counts, UINT p
+     POINT *points = pt_buf;
+     HRGN outline = 0, interior = 0;
+ 
++    g_gdi_stats.polygons += polygons;
++
+     for (i = total = 0; i < polygons; i++)
+     {
+         if (counts[i] < 2) return FALSE;
+@@ -1310,6 +1318,7 @@ BOOL dibdrv_PolyPolygon( PHYSDEV dev, const POINT *pt, const INT *counts, UINT p
+ 
+ done:
+     if (points != pt_buf) free( points );
++    record_gdi_time( start_ns );
+     return ret;
+ }
+ 
+@@ -1318,6 +1327,7 @@ done:
+  */
+ BOOL dibdrv_PolyPolyline( PHYSDEV dev, const POINT* pt, const DWORD* counts, DWORD polylines )
+ {
++    unsigned long long start_ns = get_time_ns();
+     dibdrv_physdev *pdev = get_dibdrv_pdev(dev);
+     DC *dc = get_physdev_dc( dev );
+     DWORD total, pos, i;
+@@ -1326,6 +1336,8 @@ BOOL dibdrv_PolyPolyline( PHYSDEV dev, const POINT* pt, const DWORD* counts, DWO
+     BOOL ret = TRUE;
+     HRGN outline = 0;
+ 
++    g_gdi_stats.polylines += polylines;
++
+     for (i = total = 0; i < polylines; i++)
+     {
+         if (counts[i] < 2) return FALSE;
+@@ -1362,6 +1374,7 @@ BOOL dibdrv_PolyPolyline( PHYSDEV dev, const POINT* pt, const DWORD* counts, DWO
+ 
+ done:
+     if (points != pt_buf) free( points );
++    record_gdi_time( start_ns );
+     return ret;
+ }
+ 
+@@ -1370,6 +1383,7 @@ done:
+  */
+ BOOL dibdrv_Rectangle( PHYSDEV dev, INT left, INT top, INT right, INT bottom )
+ {
++    unsigned long long start_ns = get_time_ns();
+     dibdrv_physdev *pdev = get_dibdrv_pdev(dev);
+     DC *dc = get_physdev_dc( dev );
+     RECT rect;
+@@ -1377,6 +1391,8 @@ BOOL dibdrv_Rectangle( PHYSDEV dev, INT left, INT top, INT right, INT bottom )
+     BOOL ret;
+     HRGN outline = 0;
+ 
++    g_gdi_stats.rects++;
++
+     TRACE("(%p, %d, %d, %d, %d)\n", dev, left, top, right, bottom);
+ 
+     if (dc->attr->graphics_mode == GM_ADVANCED)
+@@ -1438,6 +1454,7 @@ BOOL dibdrv_Rectangle( PHYSDEV dev, INT left, INT top, INT right, INT bottom )
+         rect.bottom -= pdev->pen_width / 2;
+         ret = brush_rect( pdev, &pdev->brush, &rect, pdev->clip );
+     }
++    record_gdi_time( start_ns );
+     return ret;
+ }
+ 
+diff --git a/dlls/win32u/gdi_perf.h b/dlls/win32u/gdi_perf.h
+new file mode 100644
+index 0000000..f577b65
+--- /dev/null
++++ b/dlls/win32u/gdi_perf.h
+@@ -0,0 +1,120 @@
++#ifndef __WINE_GDI_PERF_H
++#define __WINE_GDI_PERF_H
++
++#include <time.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++
++static inline int wine_perf_log_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        const char *env = getenv("WINE_PERF_LOG");
++        enabled = (env && env[0] && env[0] != '0') ? 1 : 0;
++    }
++    return enabled;
++}
++
++struct gdi_stats_t
++{
++    unsigned long polylines;
++    unsigned long polyline_pts;
++    unsigned long polygons;
++    unsigned long rects;
++    unsigned long texts;
++    unsigned long bitblts;
++    unsigned long scrolls;
++    unsigned long flushes;
++    unsigned long endpaints;
++    unsigned long mousemoves;
++    unsigned long invalidates;
++    unsigned long hook_calls;
++    unsigned long hook_fast_hits;
++    unsigned long wfp_fast_hits;
++    unsigned long hw_mouse_inputs;
++    unsigned long accum_sends;
++    unsigned long set_cursor_calls;
++    unsigned long timer_dispatches;
++    unsigned long long time_ns;
++    unsigned long long flush_ns;
++    unsigned long long paint_app_ns;
++    unsigned long long mousemove_ns;
++    unsigned long long wait_ns;
++};
++
++extern struct gdi_stats_t g_gdi_stats;
++extern unsigned long long g_paint_start_ns;
++
++static inline unsigned long long get_time_ns(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (unsigned long long)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
++}
++
++static inline void record_gdi_time(unsigned long long start_ns)
++{
++    static unsigned long long last_report = 0;
++    unsigned long long now = get_time_ns();
++    g_gdi_stats.time_ns += (now - start_ns);
++
++    if (now - last_report >= 1000000000ULL)
++    {
++        if (wine_perf_log_enabled() &&
++            (g_gdi_stats.polylines || g_gdi_stats.polygons || g_gdi_stats.rects ||
++             g_gdi_stats.texts || g_gdi_stats.bitblts || g_gdi_stats.scrolls || g_gdi_stats.flushes ||
++             g_gdi_stats.endpaints || g_gdi_stats.mousemoves || g_gdi_stats.invalidates))
++        {
++            FILE *f = fopen("/tmp/wine_gdi_stats.log", "a");
++            if (f)
++            {
++                fprintf(f, "[GDI_STATS pid=%d] gdi=%.1fms flush=%.1fms app_draw=%.1fms mm_proc=%.1fms wait=%.1fms | mm=%lu inv=%lu paint=%lu | hw_in=%lu accum_send=%lu set_cursor=%lu timer=%lu | hook_fast=%lu/%lu wfp_fast=%lu\n",
++                        getpid(),
++                        g_gdi_stats.time_ns / 1000000.0,
++                        g_gdi_stats.flush_ns / 1000000.0,
++                        g_gdi_stats.paint_app_ns / 1000000.0,
++                        g_gdi_stats.mousemove_ns / 1000000.0,
++                        g_gdi_stats.wait_ns / 1000000.0,
++                        g_gdi_stats.mousemoves,
++                        g_gdi_stats.invalidates,
++                        g_gdi_stats.endpaints,
++                        g_gdi_stats.hw_mouse_inputs,
++                        g_gdi_stats.accum_sends,
++                        g_gdi_stats.set_cursor_calls,
++                        g_gdi_stats.timer_dispatches,
++                        g_gdi_stats.hook_fast_hits,
++                        g_gdi_stats.hook_calls,
++                        g_gdi_stats.wfp_fast_hits);
++                fclose(f);
++            }
++        }
++        g_gdi_stats.polylines = 0;
++        g_gdi_stats.polyline_pts = 0;
++        g_gdi_stats.polygons = 0;
++        g_gdi_stats.rects = 0;
++        g_gdi_stats.texts = 0;
++        g_gdi_stats.bitblts = 0;
++        g_gdi_stats.scrolls = 0;
++        g_gdi_stats.flushes = 0;
++        g_gdi_stats.endpaints = 0;
++        g_gdi_stats.mousemoves = 0;
++        g_gdi_stats.invalidates = 0;
++        g_gdi_stats.hook_calls = 0;
++        g_gdi_stats.hook_fast_hits = 0;
++        g_gdi_stats.wfp_fast_hits = 0;
++        g_gdi_stats.hw_mouse_inputs = 0;
++        g_gdi_stats.accum_sends = 0;
++        g_gdi_stats.set_cursor_calls = 0;
++        g_gdi_stats.timer_dispatches = 0;
++        g_gdi_stats.time_ns = 0;
++        g_gdi_stats.flush_ns = 0;
++        g_gdi_stats.paint_app_ns = 0;
++        g_gdi_stats.mousemove_ns = 0;
++        g_gdi_stats.wait_ns = 0;
++        last_report = now;
++    }
++}
++
++#endif
+diff --git a/dlls/win32u/gdiobj.c b/dlls/win32u/gdiobj.c
+index e861dee..92f1918 100644
+--- a/dlls/win32u/gdiobj.c
++++ b/dlls/win32u/gdiobj.c
+@@ -37,6 +37,7 @@
+ #include "winternl.h"
+ 
+ #include "ntgdi_private.h"
++#include "win32u_private.h"
+ #include "wine/debug.h"
+ #include "wine/unixlib.h"
+ 
+@@ -1007,7 +1008,8 @@ BOOL WINAPI NtGdiUnrealizeObject( HGDIOBJ obj )
+  */
+ BOOL WINAPI NtGdiFlush(void)
+ {
+-    return TRUE;  /* FIXME */
++    flush_window_surfaces( FALSE );
++    return TRUE;
+ }
+ 
+ 
+diff --git a/dlls/win32u/hook.c b/dlls/win32u/hook.c
+index b0f49e8..ba9cb27 100644
+--- a/dlls/win32u/hook.c
++++ b/dlls/win32u/hook.c
+@@ -26,6 +26,7 @@
+ #include <assert.h>
+ #include "win32u_private.h"
+ #include "ntuser_private.h"
++#include "gdi_perf.h"
+ #include "wine/server.h"
+ #include "wine/debug.h"
+ 
+@@ -58,20 +59,29 @@ static const char *debugstr_hook_id( unsigned int id )
+     return hook_names[id - WH_MINHOOK];
+ }
+ 
+-BOOL is_hooked( INT id )
++int get_hook_count( INT id )
+ {
+     struct object_lock lock = OBJECT_LOCK_INIT;
+     const queue_shm_t *queue_shm;
+-    BOOL ret = TRUE;
++    int ret = 0;
+     UINT status;
+ 
++    if (id < WH_MINHOOK || id > WH_WINEVENT) return 0;
++
+     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
+-        ret = queue_shm->hooks_count[id - WH_MINHOOK] > 0;
++        ret = queue_shm->hooks_count[id - WH_MINHOOK];
+ 
+-    if (status) return TRUE;
++    if (status) return -1;
+     return ret;
+ }
+ 
++BOOL is_hooked( INT id )
++{
++    int count = get_hook_count( id );
++    if (count < 0) return TRUE;
++    return count > 0;
++}
++
+ /***********************************************************************
+  *           NtUserSetWindowsHookEx   (win32u.@)
+  */
+@@ -133,6 +143,12 @@ HHOOK WINAPI NtUserSetWindowsHookEx( HINSTANCE inst, UNICODE_STRING *module, DWO
+         if (!wine_server_call_err( req ))
+         {
+             handle = wine_server_ptr_handle( reply->handle );
++            if (handle)
++            {
++                struct user_thread_info *thread_info = get_user_thread_info();
++                if (thread_info && id >= WH_MINHOOK && id <= WH_WINEVENT)
++                    thread_info->cached_hooks[id - WH_MINHOOK].valid = FALSE;
++            }
+         }
+     }
+     SERVER_END_REQ;
+@@ -156,6 +172,12 @@ BOOL WINAPI NtUserUnhookWindowsHookEx( HHOOK handle )
+     }
+     SERVER_END_REQ;
+     if (status == STATUS_INVALID_HANDLE) RtlSetLastWin32Error( ERROR_INVALID_HOOK_HANDLE );
++    if (!status)
++    {
++        struct user_thread_info *thread_info = get_user_thread_info();
++        if (thread_info)
++            memset( thread_info->cached_hooks, 0, sizeof(thread_info->cached_hooks) );
++    }
+     return !status;
+ }
+ 
+@@ -177,6 +199,12 @@ BOOL WINAPI NtUserUnhookWindowsHook( INT id, HOOKPROC proc )
+     }
+     SERVER_END_REQ;
+     if (status == STATUS_INVALID_HANDLE) RtlSetLastWin32Error( ERROR_INVALID_HOOK_HANDLE );
++    if (!status)
++    {
++        struct user_thread_info *thread_info = get_user_thread_info();
++        if (thread_info && id >= WH_MINHOOK && id <= WH_WINEVENT)
++            thread_info->cached_hooks[id - WH_MINHOOK].valid = FALSE;
++    }
+     return !status;
+ }
+ 
+@@ -243,6 +271,7 @@ static LRESULT call_hook( struct win_hook_params *info, const WCHAR *module, siz
+         size_t lparam_ret_size = lparam_size;
+         HHOOK prev = thread_info->hook;
+         BOOL prev_unicode = thread_info->hook_unicode;
++        INT prev_id = thread_info->hook_id;
+         struct win_hook_params *params = info;
+         void *ret_ptr, *extra_buffer = NULL;
+         SIZE_T extra_buffer_size = 0;
+@@ -335,6 +364,7 @@ static LRESULT call_hook( struct win_hook_params *info, const WCHAR *module, siz
+ 
+         thread_info->hook = params->handle;
+         thread_info->hook_unicode = params->next_unicode;
++        thread_info->hook_id = params->id;
+         thread_info->hook_call_depth++;
+         if (!KeUserModeCallback( NtUserCallWindowsHook, params, size, &ret_ptr, &ret_len ) &&
+             ret_len >= sizeof(ret))
+@@ -346,6 +376,7 @@ static LRESULT call_hook( struct win_hook_params *info, const WCHAR *module, siz
+         }
+         thread_info->hook = prev;
+         thread_info->hook_unicode = prev_unicode;
++        thread_info->hook_id = prev_id;
+         thread_info->hook_call_depth--;
+ 
+         if (params != info) free( params );
+@@ -365,6 +396,12 @@ LRESULT WINAPI NtUserCallNextHookEx( HHOOK hhook, INT code, WPARAM wparam, LPARA
+     struct win_hook_params info;
+     WCHAR module[MAX_PATH];
+ 
++    if (thread_info && thread_info->hook_id >= WH_MINHOOK && thread_info->hook_id <= WH_WINEVENT)
++    {
++        int count = get_hook_count( thread_info->hook_id );
++        if (count <= 1) return 0;
++    }
++
+     memset( &info, 0, sizeof(info) );
+ 
+     SERVER_START_REQ( get_hook_info )
+@@ -429,18 +466,44 @@ LRESULT call_current_hook( HHOOK hhook, INT code, WPARAM wparam, LPARAM lparam )
+ LRESULT call_message_hooks( INT id, INT code, WPARAM wparam, LPARAM lparam, size_t lparam_size,
+                             size_t message_size, BOOL ansi )
+ {
++    struct user_thread_info *thread_info = get_user_thread_info();
+     struct win_hook_params info;
+     WCHAR module[MAX_PATH];
+     DWORD_PTR ret;
++    int count;
++    int idx = id - WH_MINHOOK;
+ 
+     user_check_not_lock();
+ 
+-    if (!is_hooked( id ))
++    if (idx < 0 || idx >= NB_HOOKS) return 0;
++
++    count = get_hook_count( id );
++    if (count <= 0)
+     {
+-        TRACE( "skipping hook %s\n", hook_names[id - WH_MINHOOK] );
++        TRACE( "skipping hook %s\n", hook_names[idx] );
+         return 0;
+     }
+ 
++    g_gdi_stats.hook_calls++;
++
++    if (count == 1 && thread_info && thread_info->cached_hooks[idx].valid)
++    {
++        g_gdi_stats.hook_fast_hits++;
++        memset( &info, 0, sizeof(info) );
++        info.prev_unicode = TRUE;
++        info.id           = id;
++        info.handle       = thread_info->cached_hooks[idx].handle;
++        info.proc         = thread_info->cached_hooks[idx].proc;
++        info.pid          = thread_info->cached_hooks[idx].pid;
++        info.tid          = thread_info->cached_hooks[idx].tid;
++        info.next_unicode = thread_info->cached_hooks[idx].next_unicode;
++        info.code         = code;
++        info.wparam       = wparam;
++        info.lparam       = lparam;
++
++        return call_hook( &info, thread_info->cached_hooks[idx].module, lparam_size, message_size, ansi );
++    }
++
+     memset( &info, 0, sizeof(info) );
+     info.prev_unicode = TRUE;
+     info.id = id;
+@@ -463,6 +526,17 @@ LRESULT call_message_hooks( INT id, INT code, WPARAM wparam, LPARAM lparam, size
+     SERVER_END_REQ;
+     if (!info.tid && !info.proc) return 0;
+ 
++    if (count == 1 && thread_info)
++    {
++        thread_info->cached_hooks[idx].handle       = info.handle;
++        thread_info->cached_hooks[idx].proc         = info.proc;
++        thread_info->cached_hooks[idx].pid          = info.pid;
++        thread_info->cached_hooks[idx].tid          = info.tid;
++        thread_info->cached_hooks[idx].next_unicode = info.next_unicode;
++        wcscpy( thread_info->cached_hooks[idx].module, module );
++        thread_info->cached_hooks[idx].valid        = TRUE;
++    }
++
+     info.code   = code;
+     info.wparam = wparam;
+     info.lparam = lparam;
+diff --git a/dlls/win32u/input.c b/dlls/win32u/input.c
+index c24bbab..712a857 100644
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -36,6 +36,7 @@
+ #include "wine/server.h"
+ #include "wine/debug.h"
+ #include "kbd.h"
++#include "gdi_perf.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(win);
+ WINE_DECLARE_DEBUG_CHANNEL(keyboard);
+@@ -692,6 +693,7 @@ static NTSTATUS send_mouse_motion( UINT flags )
+ 
+     if (!input.mi.dwFlags && !input.mi.mouseData && !info->raw_mouse.count) return STATUS_SUCCESS; /* ignore empty inputs */
+ 
++    g_gdi_stats.accum_sends++;
+     TRACE( "Sending %s (%u raw frames)\n", debugstr_mouseinput( &input.mi ), info->raw_mouse.count );
+     status = server_send_hardware_message( info->mouse_hwnd, flags, &input, (LPARAM)&info->raw_mouse );
+     memset( &info->mouse_motion, 0, sizeof(info->mouse_motion) );
+@@ -746,8 +748,9 @@ NTSTATUS send_hardware_input( HWND hwnd, UINT flags, const INPUT *input, LPARAM
+ {
+     if (input->type == INPUT_MOUSE)
+     {
+-        const struct raw_mouse empty_raw = {0}, *raw = lparam ? (void *)lparam : &empty_raw;
+-        return accum_mouse_motion( hwnd, flags, *input, raw );
++        g_gdi_stats.hw_mouse_inputs++;
++        g_gdi_stats.accum_sends++;
++        return server_send_hardware_message( hwnd, flags, input, lparam );
+     }
+ 
+     return server_send_hardware_message( hwnd, flags, input, lparam );
+@@ -815,6 +818,8 @@ BOOL WINAPI NtUserSetCursorPos( INT x, INT y )
+     BOOL ret;
+     INT prev_x, prev_y, new_x, new_y;
+ 
++    g_gdi_stats.set_cursor_calls++;
++
+     rect = map_rect_virt_to_raw( rect, get_thread_dpi() );
+     SERVER_START_REQ( set_cursor )
+     {
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index 8c9a2aa..84a6dfa 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -36,6 +36,7 @@
+ #include "dde.h"
+ #include "immdev.h"
+ #include "wine/debug.h"
++#include "gdi_perf.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(msg);
+ WINE_DECLARE_DEBUG_CHANNEL(key);
+@@ -2588,6 +2589,64 @@ static WORD pointer_buttons_from_mouse_buttons( WORD mouse_flags )
+     return pointer_flags;
+ }
+ 
++struct drop_debug_stats
++{
++    unsigned long hw_msgs;
++    unsigned long hw_rawinput;
++    unsigned long hw_kbd;
++    unsigned long hw_mouse;
++    unsigned long hw_pointer;
++    unsigned long hw_clipcursor;
++    unsigned long hw_setcursor;
++    unsigned long hw_other;
++    unsigned long drop_no_wnd;
++    unsigned long drop_filter;
++    unsigned long drop_range;
++    unsigned long drop_hook;
++    unsigned long drop_nowhere;
++    unsigned long drop_eat;
++    unsigned long ok_mouse;
++    unsigned long hw_ret_1;
++    unsigned long hw_drop;
++    HWND last_msg_hwnd;
++    HWND last_filter_hwnd;
++    UINT last_msg_id;
++    UINT last_first;
++    UINT last_last;
++};
++static struct drop_debug_stats g_drop_stats;
++
++static void log_drop_stats(void)
++{
++    static unsigned long long last_log = 0;
++    unsigned long long now;
++    if (!wine_perf_log_enabled()) return;
++    now = get_time_ns();
++    if (now - last_log >= 1000000000ULL)
++    {
++        last_log = now;
++        if (g_drop_stats.hw_msgs || g_drop_stats.hw_drop || g_drop_stats.hw_ret_1)
++        {
++            FILE *f = fopen( "/tmp/wine_drop_debug.log", "a" );
++            if (f)
++            {
++                fprintf( f, "[DROP_DEBUG pid=%d tid=%04x] hw_total=%lu (raw=%lu kbd=%lu mouse=%lu ptr=%lu clip=%lu setcur=%lu oth=%lu) | drops: no_wnd=%lu(last=%p) filter=%lu(msg=%p flt=%p) range=%lu(id=%x [%x..%x]) hook=%lu nwhr=%lu eat=%lu | ok_mouse=%lu hw_ret_1=%lu hw_drop=%lu\n",
++                         getpid(), GetCurrentThreadId(),
++                         g_drop_stats.hw_msgs, g_drop_stats.hw_rawinput, g_drop_stats.hw_kbd,
++                         g_drop_stats.hw_mouse, g_drop_stats.hw_pointer, g_drop_stats.hw_clipcursor,
++                         g_drop_stats.hw_setcursor, g_drop_stats.hw_other,
++                         g_drop_stats.drop_no_wnd, g_drop_stats.last_msg_hwnd,
++                         g_drop_stats.drop_filter, g_drop_stats.last_msg_hwnd, g_drop_stats.last_filter_hwnd,
++                         g_drop_stats.drop_range, g_drop_stats.last_msg_id, g_drop_stats.last_first, g_drop_stats.last_last,
++                         g_drop_stats.drop_hook, g_drop_stats.drop_nowhere, g_drop_stats.drop_eat,
++                         g_drop_stats.ok_mouse, g_drop_stats.hw_ret_1, g_drop_stats.hw_drop );
++                fclose( f );
++            }
++            memset( &g_drop_stats, 0, sizeof(g_drop_stats) );
++        }
++    }
++}
++
+ /***********************************************************************
+  *          process_mouse_message
+  *
+@@ -2607,6 +2666,8 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+     BOOL eat_msg;
+     WPARAM wparam;
+ 
++    if (msg->message == WM_MOUSEMOVE) g_gdi_stats.mousemoves++;
++
+     /* find the window to dispatch this mouse message to */
+ 
+     info.cbSize = sizeof(info);
+@@ -2633,6 +2694,8 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+ 
+     if (!msg->hwnd || !is_current_thread_window( msg->hwnd ))
+     {
++        g_drop_stats.drop_no_wnd++;
++        g_drop_stats.last_msg_hwnd = msg->hwnd;
+         accept_hardware_message( hw_id );
+         return FALSE;
+     }
+@@ -2713,7 +2776,13 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+     event.paramH  = msg->pt.y;
+     call_hooks( WH_JOURNALRECORD, HC_ACTION, 0, (LPARAM)&event, sizeof(event) );
+ 
+-    if (!check_hwnd_filter( msg, hwnd_filter )) return FALSE;
++    if (!check_hwnd_filter( msg, hwnd_filter ))
++    {
++        g_drop_stats.drop_filter++;
++        g_drop_stats.last_msg_hwnd = msg->hwnd;
++        g_drop_stats.last_filter_hwnd = hwnd_filter;
++        return FALSE;
++    }
+ 
+     pt = msg->pt;
+     message = msg->message;
+@@ -2768,13 +2837,27 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+                }
+            }
+         }
+-        if (message < first || message > last) return FALSE;
++        if (message < first || message > last)
++        {
++            g_drop_stats.drop_range++;
++            g_drop_stats.last_msg_id = message;
++            g_drop_stats.last_first = first;
++            g_drop_stats.last_last = last;
++            return FALSE;
++        }
+         /* update static double click conditions */
+         if (update) clk_msg = *msg;
+     }
+     else
+     {
+-        if (message < first || message > last) return FALSE;
++        if (message < first || message > last)
++        {
++            g_drop_stats.drop_range++;
++            g_drop_stats.last_msg_id = message;
++            g_drop_stats.last_first = first;
++            g_drop_stats.last_last = last;
++            return FALSE;
++        }
+     }
+     msg->wParam = wparam;
+ 
+@@ -2787,6 +2870,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+     hook.mouseData    = msg->wParam;
+     if (call_hooks( WH_MOUSE, remove ? HC_ACTION : HC_NOREMOVE, message, (LPARAM)&hook, sizeof(hook) ))
+     {
++        g_drop_stats.drop_hook++;
+         hook.pt           = msg->pt;
+         hook.hwnd         = msg->hwnd;
+         hook.wHitTestCode = hittest;
+@@ -2799,6 +2883,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+ 
+     if ((hittest == HTERROR) || (hittest == HTNOWHERE))
+     {
++        g_drop_stats.drop_nowhere++;
+         send_message( msg->hwnd, WM_SETCURSOR, (WPARAM)msg->hwnd, MAKELONG( hittest, msg->message ));
+         accept_hardware_message( hw_id );
+         return FALSE;
+@@ -2808,6 +2893,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+ 
+     if (!remove || info.hwndCapture)
+     {
++        g_drop_stats.ok_mouse++;
+         msg->message = message;
+         return TRUE;
+     }
+@@ -2864,6 +2950,8 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+     send_message( msg->hwnd, WM_SETCURSOR, (WPARAM)msg->hwnd, MAKELONG( hittest, msg->message ));
+ 
+     msg->message = message;
++    if (eat_msg) g_drop_stats.drop_eat++;
++    else g_drop_stats.ok_mouse++;
+     return !eat_msg;
+ }
+ 
+@@ -2892,20 +2980,42 @@ static BOOL process_hardware_message( MSG *msg, UINT hw_id, const struct hardwar
+     msg->pt.x = rect.left;
+     msg->pt.y = rect.top;
+ 
++    g_drop_stats.hw_msgs++;
+     if (msg->message == WM_INPUT || msg->message == WM_INPUT_DEVICE_CHANGE)
++    {
++        g_drop_stats.hw_rawinput++;
+         ret = process_rawinput_message( msg, hw_id, msg_data );
++    }
+     else if (is_keyboard_message( msg->message ))
++    {
++        g_drop_stats.hw_kbd++;
+         ret = process_keyboard_message( msg, hw_id, hwnd_filter, first, last, remove );
++    }
+     else if (is_mouse_message( msg->message ))
++    {
++        g_drop_stats.hw_mouse++;
+         ret = process_mouse_message( msg, hw_id, msg_data->info, hwnd_filter, first, last, remove );
++    }
+     else if (msg->message >= WM_POINTERUPDATE && msg->message <= WM_POINTERLEAVE)
++    {
++        g_drop_stats.hw_pointer++;
+         ret = process_pointer_message( msg, hw_id, msg_data );
++    }
+     else if (msg->message == WM_WINE_CLIPCURSOR)
++    {
++        g_drop_stats.hw_clipcursor++;
+         process_wine_clipcursor( msg->hwnd, msg->wParam, msg->lParam );
++    }
+     else if (msg->message == WM_WINE_SETCURSOR)
++    {
++        g_drop_stats.hw_setcursor++;
+         process_wine_setcursor( msg->hwnd, (HWND)msg->wParam, (HCURSOR)msg->lParam );
++    }
+     else
++    {
++        g_drop_stats.hw_other++;
+         ERR( "unknown message type %x\n", msg->message );
++    }
+     set_thread_dpi_awareness_context( context );
+     if (!ret) thread_info->client_info->msg_source = prev_source;
+     return ret;
+@@ -3028,6 +3138,7 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
+             if (buffer != buffer_init) free( buffer );
+             if (res == STATUS_PENDING)
+             {
++                log_drop_stats();
+                 if (hwnd == (HWND)-1 && idle_event) NtSetEvent( idle_event, NULL );
+                 return 0;
+             }
+@@ -3163,9 +3274,13 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
+                 if (!process_hardware_message( &info.msg, hw_id, &msg_data->hardware,
+                                                hwnd, first, last, flags & PM_REMOVE ))
+                 {
++                    g_drop_stats.hw_drop++;
++                    log_drop_stats();
+                     TRACE("dropping msg %x\n", info.msg.message );
+                     continue;  /* ignore it */
+                 }
++                g_drop_stats.hw_ret_1++;
++                log_drop_stats();
+                 *msg = info.msg;
+                 thread_info->message_pos   = MAKELONG( info.msg.pt.x, info.msg.pt.y );
+                 thread_info->message_time  = info.msg.time;
+@@ -3343,15 +3458,16 @@ static BOOL check_internal_bits( UINT mask )
+ 
+ static BOOL process_driver_events( UINT events_mask, UINT wake_mask, UINT changed_mask )
+ {
++    BOOL had_driver = check_internal_bits( QS_DRIVER );
+     BOOL drained = FALSE;
+ 
+-    if (check_internal_bits( QS_DRIVER )) drained = user_driver->pProcessEvents( events_mask );
++    if (had_driver) drained = user_driver->pProcessEvents( events_mask );
+ 
+-    if (drained || !check_queue_masks( wake_mask, changed_mask ))
++    if (had_driver || drained || !check_queue_masks( wake_mask, changed_mask ))
+     {
+         SERVER_START_REQ( set_queue_mask )
+         {
+-            req->poll_events = drained;
++            req->poll_events = TRUE; /* ALWAYS re-arm POLLIN on queue->fd so Wineserver epoll wakes us up on mouse movement! */
+             req->wake_mask = wake_mask;
+             req->changed_mask = changed_mask;
+             wine_server_call( req );
+@@ -3412,6 +3528,8 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
+     ULONG ret_len;
+     HANDLE event;
+     DWORD ret;
++    unsigned long long wait_t0, wait_dur;
++    int iter = 0;
+ 
+     if ((abs = get_nt_timeout( &time, timeout )))
+     {
+@@ -3429,8 +3547,27 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
+     process_driver_events( QS_ALLINPUT, wake_mask, changed_mask );
+     if (!(changed_mask & QS_SMRESULT) && (event = get_user_thread_info()->idle_event)) NtSetEvent( event, NULL );
+ 
+-    do ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), abs );
++    wait_t0 = get_time_ns();
++    do
++    {
++        iter++;
++        ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), abs );
++    }
+     while (ret == count - 1 && !process_driver_events( QS_ALLINPUT, wake_mask, changed_mask ));
++    wait_dur = get_time_ns() - wait_t0;
++    g_gdi_stats.wait_ns += wait_dur;
++
++    if (wine_perf_log_enabled() && wait_dur > 20000000ULL)
++    {
++        FILE *f = fopen("/tmp/wine_wait_debug.log", "a");
++        if (f)
++        {
++            fprintf(f, "[WAIT_DEBUG tid=%04x] dur=%.1fms count=%u ret=%x iter=%d timeout=%u wake_mask=%x chg_mask=%x\n",
++                    GetCurrentThreadId(), wait_dur / 1000000.0, (unsigned)count, (unsigned)ret, iter, (unsigned)timeout,
++                    (unsigned)wake_mask, (unsigned)changed_mask);
++            fclose(f);
++        }
++    }
+ 
+     if (HIWORD(ret)) /* is it an error code? */
+     {
+@@ -3939,6 +4076,7 @@ NTSTATUS server_send_hardware_message( HWND hwnd, UINT flags, const INPUT *input
+             req->input.mouse.flags = input->mi.dwFlags;
+             req->input.mouse.time  = input->mi.time;
+             req->input.mouse.info  = input->mi.dwExtraInfo;
++            req->input.mouse.raw_count = 0;
+             if (lparam)
+             {
+                 struct raw_mouse *raw = (struct raw_mouse *)lparam;
+@@ -3994,6 +4132,23 @@ NTSTATUS server_send_hardware_message( HWND hwnd, UINT flags, const INPUT *input
+             break;
+         }
+         ret = wine_server_call( req );
++        if (ret)
++        {
++            static unsigned long long last_err_time = 0;
++            static unsigned long err_count = 0;
++            unsigned long long now_err = get_time_ns();
++            err_count++;
++            if (now_err - last_err_time > 1000000000ULL)
++            {
++                FILE *f = fopen("/tmp/wine_client_err.log", "a");
++                last_err_time = now_err;
++                if (f)
++                {
++                    fprintf(f, "[CLIENT_ERR] server_send_hw returned %x count=%lu\n", (unsigned)ret, err_count);
++                    fclose(f);
++                }
++            }
++        }
+         wait = reply->wait;
+         prev_x = reply->prev_x;
+         prev_y = reply->prev_y;
+@@ -4035,6 +4190,7 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
+ {
+     struct win_proc_params params;
+     LRESULT retval = 0;
++    unsigned long long mm_t0 = 0;
+ 
+     /* Process timer messages */
+     if (msg->lParam && msg->message == WM_TIMER)
+@@ -4063,12 +4219,17 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
+ 
+     spy_enter_message( SPY_DISPATCHMESSAGE, msg->hwnd, msg->message, msg->wParam, msg->lParam );
+ 
++    if (msg->message == WM_MOUSEMOVE) mm_t0 = get_time_ns();
++    if (msg->message == WM_TIMER || msg->message == WM_SYSTIMER) g_gdi_stats.timer_dispatches++;
++
+     if (init_window_call_params( &params, msg->hwnd, msg->message, msg->wParam, msg->lParam,
+                                  FALSE, WMCHAR_MAP_DISPATCHMESSAGE ))
+         retval = dispatch_win_proc_params( &params, sizeof(params), NULL, NULL );
+     else if (!is_window( msg->hwnd )) RtlSetLastWin32Error( ERROR_INVALID_WINDOW_HANDLE );
+     else RtlSetLastWin32Error( ERROR_MESSAGE_SYNC_ONLY );
+ 
++    if (mm_t0) g_gdi_stats.mousemove_ns += (get_time_ns() - mm_t0);
++
+     spy_exit_message( SPY_RESULT_OK, msg->hwnd, msg->message, retval, msg->wParam, msg->lParam );
+ 
+     if (msg->message == WM_PAINT)
+diff --git a/dlls/win32u/ntgdi_private.h b/dlls/win32u/ntgdi_private.h
+index fcfbce5..e2c8896 100644
+--- a/dlls/win32u/ntgdi_private.h
++++ b/dlls/win32u/ntgdi_private.h
+@@ -600,6 +600,8 @@ static inline void union_rect( RECT *dest, const RECT *src1, const RECT *src2 )
+     }
+ }
+ 
++extern volatile LONG g_any_surface_dirty;
++
+ static inline void add_bounds_rect( RECT *bounds, const RECT *rect )
+ {
+     if (IsRectEmpty( rect )) return;
+@@ -607,6 +609,7 @@ static inline void add_bounds_rect( RECT *bounds, const RECT *rect )
+     bounds->top    = min( bounds->top, rect->top );
+     bounds->right  = max( bounds->right, rect->right );
+     bounds->bottom = max( bounds->bottom, rect->bottom );
++    g_any_surface_dirty = 1;
+ }
+ 
+ static inline int get_bitmap_stride( int width, int bpp )
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+index 26bab84..e5c79c9 100644
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -100,6 +100,28 @@ struct mouse_tracking_info
+     POINT last_mouse_message_pos;
+ };
+ 
++struct cached_hook
++{
++    BOOL                          valid;
++    void                         *handle;
++    void                         *proc;
++    DWORD                         pid;
++    DWORD                         tid;
++    int                           next_unicode;
++    WCHAR                         module[MAX_PATH];
++};
++
++struct wfp_cache
++{
++    HWND                          hwnd;
++    POINT                         pt;
++    HWND                          ret;
++    INT                           hittest;
++    BOOL                          single_leaf;
++    RECT                          screen_client;
++    ULONGLONG                     tick;
++};
++
+ /* internal per-thread data */
+ struct user_thread_info
+ {
+@@ -113,6 +135,9 @@ struct user_thread_info
+     WORD                          hook_call_depth;        /* Number of recursively called hook procs */
+     WORD                          hook_unicode;           /* Is current hook unicode? */
+     HHOOK                         hook;                   /* Current hook */
++    INT                           hook_id;                /* Current hook ID */
++    struct cached_hook            cached_hooks[NB_HOOKS]; /* Per-thread cached single-hooks */
++    struct wfp_cache              wfp_cache;              /* Per-thread window_from_point cache */
+     struct received_message_info *receive_info;           /* Message being currently received */
+     UINT                          message_time;           /* value for GetMessageTime */
+     UINT                          message_pos;            /* value for GetMessagePos */
+diff --git a/dlls/win32u/painting.c b/dlls/win32u/painting.c
+index ee643b7..1592a50 100644
+--- a/dlls/win32u/painting.c
++++ b/dlls/win32u/painting.c
+@@ -34,9 +34,13 @@
+ #include "winerror.h"
+ #include "ntgdi_private.h"
+ #include "wine/debug.h"
++#include "gdi_perf.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(gdi);
+ 
++struct gdi_stats_t g_gdi_stats = {0};
++unsigned long long g_paint_start_ns = 0;
++
+ 
+ /***********************************************************************
+  *           null driver fallback implementations
+@@ -1022,7 +1026,11 @@ BOOL WINAPI NtUserScrollDC( HDC hdc, INT dx, INT dy, const RECT *scroll, const R
+         NtGdiCombineRgn( update_rgn, update_rgn, dstrgn, RGN_DIFF );
+     }
+ 
++    unsigned long long start_ns = get_time_ns();
++
++    g_gdi_stats.scrolls++;
+     ret = user_driver->pScrollDC( hdc, dx, dy, update_rgn );
++    record_gdi_time( start_ns );
+ 
+     if (ret && update_rect)
+     {
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 2c92515..70f51f6 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -50,6 +50,7 @@ extern void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *s
+ extern struct window_surface *get_driver_window_surface( struct window_surface *surface, struct ratio monitor_dpi );
+ extern void erase_now( HWND hwnd, UINT rdw_flags );
+ extern void flush_window_surfaces( BOOL idle );
++extern void flush_window_surfaces_force(void);
+ extern void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects );
+ extern void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
+                                       const RECT *old_visible_rect, const RECT *valid_rects );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 03ce398..054b730 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -28,6 +28,7 @@
+ #include "ntstatus.h"
+ #include "ntgdi_private.h"
+ #include "ntuser_private.h"
++#include "gdi_perf.h"
+ #include "wine/opengl_driver.h"
+ #include "wine/server.h"
+ #include "wine/debug.h"
+@@ -2852,17 +2853,53 @@ static HWND *list_children_from_point( HWND hwnd, POINT pt, struct ratio dpi )
+  */
+ HWND window_from_point( HWND hwnd, POINT pt, INT *hittest, BOOL send_nchittest )
+ {
++    struct user_thread_info *thread_info = get_user_thread_info();
+     int i, res;
+     HWND ret, *list;
+     POINT win_pt;
+     struct ratio dpi = get_thread_dpi(), raw_dpi;
++    ULONGLONG now;
+ 
+     if (!hwnd) hwnd = get_desktop_window();
+     if (!dpi.num) dpi = get_win_monitor_dpi( hwnd, &raw_dpi );
+ 
++    now = NtGetTickCount();
++
++    if (thread_info)
++    {
++        /* 1. Exact match check */
++        if (thread_info->wfp_cache.ret && thread_info->wfp_cache.hwnd == hwnd &&
++            thread_info->wfp_cache.pt.x == pt.x && thread_info->wfp_cache.pt.y == pt.y &&
++            (now - thread_info->wfp_cache.tick) < 50)
++        {
++            g_gdi_stats.wfp_fast_hits++;
++            *hittest = thread_info->wfp_cache.hittest;
++            return thread_info->wfp_cache.ret;
++        }
++
++        /* 2. Leaf client-area fast path (e.g. dragging across SchView) */
++        if (thread_info->wfp_cache.single_leaf && thread_info->wfp_cache.ret &&
++            thread_info->wfp_cache.hwnd == hwnd &&
++            thread_info->wfp_cache.hittest == HTCLIENT &&
++            (now - thread_info->wfp_cache.tick) < 50 &&
++            is_window( thread_info->wfp_cache.ret ) &&
++            PtInRect( &thread_info->wfp_cache.screen_client, pt ))
++        {
++            g_gdi_stats.wfp_fast_hits++;
++            *hittest = HTCLIENT;
++            thread_info->wfp_cache.pt = pt;
++            thread_info->wfp_cache.tick = now;
++            return thread_info->wfp_cache.ret;
++        }
++    }
++
+     *hittest = HTNOWHERE;
+ 
+-    if (!(list = list_children_from_point( hwnd, pt, dpi ))) return 0;
++    if (!(list = list_children_from_point( hwnd, pt, dpi )))
++    {
++        if (thread_info) thread_info->wfp_cache.ret = 0;
++        return 0;
++    }
+ 
+     /* now determine the hittest */
+ 
+@@ -2892,6 +2929,22 @@ HWND window_from_point( HWND hwnd, POINT pt, INT *hittest, BOOL send_nchittest )
+         /* continue search with next window in z-order */
+     }
+     ret = list[i];
++
++    if (thread_info)
++    {
++        thread_info->wfp_cache.hwnd = hwnd;
++        thread_info->wfp_cache.pt = pt;
++        thread_info->wfp_cache.ret = ret;
++        thread_info->wfp_cache.hittest = *hittest;
++        thread_info->wfp_cache.tick = now;
++        thread_info->wfp_cache.single_leaf = (ret != 0 && list[0] == ret && list[1] == 0);
++        if (thread_info->wfp_cache.single_leaf && *hittest == HTCLIENT)
++        {
++            if (!get_client_rect_rel( ret, COORDS_SCREEN, &thread_info->wfp_cache.screen_client, dpi ))
++                thread_info->wfp_cache.single_leaf = FALSE;
++        }
++    }
++
+     free( list );
+     TRACE( "scope %p (%d,%d) returning %p\n", hwnd, pt.x, pt.y, ret );
+     return ret;
+diff --git a/server/atom.c b/server/atom.c
+index 4c98a57..8d60731 100644
+--- a/server/atom.c
++++ b/server/atom.c
+@@ -389,6 +389,13 @@ DECL_HANDLER(find_atom)
+ DECL_HANDLER(get_atom_information)
+ {
+     struct atom_entry *entry;
++    static int atom_info_count = 0;
++    if (atom_info_count < 100)
++    {
++        FILE *f = fopen( "/tmp/atom_log.txt", "a" );
++        if (f) { fprintf( f, "GLOBAL: atom=0x%04x\n", req->atom ); fclose( f ); }
++        atom_info_count++;
++    }
+ 
+     if ((entry = get_atom_entry( global_table, req->atom )))
+     {
+@@ -410,6 +417,13 @@ DECL_HANDLER(add_user_atom)
+ DECL_HANDLER(get_user_atom_name)
+ {
+     struct atom_entry *entry;
++    static int atom_user_count = 0;
++    if (atom_user_count < 100)
++    {
++        FILE *f = fopen( "/tmp/atom_log.txt", "a" );
++        if (f) { fprintf( f, "USER: atom=0x%04x\n", req->atom ); fclose( f ); }
++        atom_user_count++;
++    }
+ 
+     if ((entry = get_atom_entry( user_table, req->atom )))
+     {
+diff --git a/server/queue.c b/server/queue.c
+index 2449f0c..0a56586 100644
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -199,6 +199,54 @@ static unsigned int cursor_history_latest;
+ static void queue_hardware_message( struct desktop *desktop, struct message *msg, int always_queue );
+ static void free_message( struct message *msg );
+ 
++struct ws_stats
++{
++    unsigned long send_hw_req;
++    unsigned long mouse_in;
++    unsigned long raw_err;
++    unsigned long no_move;
++    unsigned long q_hw;
++    unsigned long no_target;
++    unsigned long q_merged;
++    unsigned long q_added;
++    unsigned long get_hw;
++    unsigned long get_hw_ret;
++    unsigned long accept_hw;
++    unsigned int last_q_tid;
++    user_handle_t last_q_win;
++    unsigned int last_get_tid;
++};
++static struct ws_stats g_ws_stats;
++
++static void check_ws_stats_log(void)
++{
++    static int enabled = -1;
++    static timeout_t last_log = 0;
++    FILE *f;
++    if (enabled < 0)
++    {
++        const char *env = getenv("WINE_PERF_LOG");
++        enabled = (env && env[0] && env[0] != '0') ? 1 : 0;
++    }
++    if (!enabled) return;
++    if (monotonic_time - last_log > TICKS_PER_SEC)
++    {
++        last_log = monotonic_time;
++        f = fopen("/tmp/wine_ws_pipe.log", "a");
++        if (f)
++        {
++            fprintf(f, "[WS_PIPE] send_hw=%lu mouse_in=%lu raw_err=%lu no_move=%lu | q_hw=%lu no_target=%lu merged=%lu added=%lu (q_tid=%04x q_win=%08x) | get_hw=%lu ret=%lu accept=%lu (get_tid=%04x)\n",
++                    g_ws_stats.send_hw_req, g_ws_stats.mouse_in, g_ws_stats.raw_err, g_ws_stats.no_move,
++                    g_ws_stats.q_hw, g_ws_stats.no_target, g_ws_stats.q_merged, g_ws_stats.q_added,
++                    g_ws_stats.last_q_tid, g_ws_stats.last_q_win,
++                    g_ws_stats.get_hw, g_ws_stats.get_hw_ret, g_ws_stats.accept_hw,
++                    g_ws_stats.last_get_tid);
++            fclose(f);
++        }
++        memset(&g_ws_stats, 0, sizeof(g_ws_stats));
++    }
++}
++
+ /* set the caret window in a given thread input, requires write lock on the thread input shared member */
+ static void set_caret_window( struct thread_input *input, input_shm_t *shared, user_handle_t win )
+ {
+@@ -820,6 +868,7 @@ static struct message *find_mouse_message( struct thread_input *input, const str
+         if (prev->msg != WM_INPUT) break;
+     }
+     if (!ptr) return NULL;
++    if (prev->unique_id) return NULL; /* don't merge into a message already in flight to the client */
+     if (prev->result) return NULL;
+     if (prev->win && msg->win && prev->win != msg->win) return NULL;
+     if (prev->msg != msg->msg) return NULL;
+@@ -1782,10 +1831,18 @@ static user_handle_t find_hardware_message_window( struct desktop *desktop, stru
+         break;
+     case QS_MOUSEMOVE:
+     case QS_MOUSEBUTTON:
++        if (desktop->foreground_input && (win = desktop->foreground_input->shared->capture))
++        {
++            *thread = get_window_thread( win );
++            break;
++        }
+         if (!input || !(win = input_shm->capture))
+         {
+-            if (is_window_visible( msg->win ) && !is_window_transparent( msg->win )) win = msg->win;
+-            else win = shallow_window_from_point( desktop, msg->x, msg->y );
++            user_handle_t top_handle = get_desktop_top_window( desktop );
++            if (msg->win && msg->win != top_handle && is_window_visible( msg->win ) && !is_window_transparent( msg->win ))
++                win = msg->win;
++            else
++                win = shallow_window_from_point( desktop, msg->x, msg->y );
+             *thread = window_thread_from_point( win, msg->x, msg->y );
+         }
+         break;
+@@ -1836,7 +1893,7 @@ static unsigned int get_rawinput_device_flags( struct process *process, struct m
+ static void queue_hardware_message( struct desktop *desktop, struct message *msg, int always_queue )
+ {
+     desktop_shm_t *desktop_shm = desktop->shared;
+-    user_handle_t win;
++    user_handle_t win, top_handle;
+     struct thread *thread;
+     struct thread_input *input;
+     struct hardware_msg_data *msg_data = msg->data;
+@@ -1872,7 +1929,12 @@ static void queue_hardware_message( struct desktop *desktop, struct message *msg
+     msg->x = desktop_shm->cursor.x;
+     msg->y = desktop_shm->cursor.y;
+ 
+-    if (msg->win && (thread = get_window_thread( msg->win )))
++    top_handle = get_desktop_top_window( desktop );
++    if (desktop->foreground_input && desktop->foreground_input->shared->capture)
++    {
++        input = desktop->foreground_input;
++    }
++    else if (msg->win && msg->win != top_handle && (thread = get_window_thread( msg->win )))
+     {
+         input = thread->queue->input;
+         release_object( thread );
+@@ -1885,18 +1947,31 @@ static void queue_hardware_message( struct desktop *desktop, struct message *msg
+     if (input && (get_hardware_msg_bit( msg->msg ) & (QS_KEY | QS_MOUSEBUTTON)))
+         input->user_time = monotonic_time;
+ 
++    g_ws_stats.q_hw++;
+     if (!win || !thread || (flags & RIDEV_NOLEGACY))
+     {
++        g_ws_stats.no_target++;
+         if (input && !(flags & RIDEV_NOLEGACY)) update_thread_input_key_state( input, msg->msg, msg->wparam );
+         free_message( msg );
+         if (thread) release_object( thread );
+         return;
+     }
+ 
++    g_ws_stats.last_q_tid = thread->id;
++    g_ws_stats.last_q_win = win;
++
+     if (win != msg->win) always_queue = 1;
+-    if (!always_queue || merge_message( input, msg )) free_message( msg );
++    msg->win = win;
++
++    if (!always_queue || merge_message( input, msg ))
++    {
++        g_ws_stats.q_merged++;
++        set_queue_bits( thread->queue, msg_bit );
++        free_message( msg );
++    }
+     else
+     {
++        g_ws_stats.q_added++;
+         msg->unique_id = 0;  /* will be set once we return it to the app */
+         list_add_tail( &input->msg_list, &msg->entry );
+         set_queue_bits( thread->queue, msg_bit );
+@@ -2195,8 +2270,10 @@ static int queue_mouse_message( struct desktop *desktop, user_handle_t win, cons
+         WM_MOUSEHWHEEL   /* 0x1000 = MOUSEEVENTF_HWHEEL */
+     };
+ 
++    g_ws_stats.mouse_in++;
+     if (input->mouse.raw_count != get_req_data_size() / sizeof(*raw))
+     {
++        g_ws_stats.raw_err++;
+         set_error( STATUS_INVALID_PARAMETER );
+         return 0;
+     }
+@@ -2234,7 +2311,10 @@ static int queue_mouse_message( struct desktop *desktop, user_handle_t win, cons
+             y = desktop_shm->cursor.y + input->mouse.y;
+         }
+         if (x == desktop_shm->cursor.x && y == desktop_shm->cursor.y)
++        {
++            g_ws_stats.no_move++;
+             flags &= ~MOUSEEVENTF_MOVE;
++        }
+     }
+     else
+     {
+@@ -2284,14 +2364,22 @@ static int queue_mouse_message( struct desktop *desktop, user_handle_t win, cons
+         msg->mergeable = !(flags & MOUSEEVENTF_MOVE_NOCOALESCE);
+         if (origin == IMO_INJECTED) msg_data->flags = LLMHF_INJECTED;
+ 
+-        /* specify a sender only when sending the last message */
+-        if (!(flags & ((1 << ARRAY_SIZE( messages )) - 1)))
++        /* For WM_MOUSEMOVE, queue immediately to prevent low-level hook stalls and latency */
++        if (messages[i] == WM_MOUSEMOVE)
++        {
++            queue_hardware_message( desktop, msg, 0 );
++        }
++        else
+         {
+-            if (!(wait = send_hook_ll_message( desktop, msg, WH_MOUSE_LL, wparam, sender )))
++            /* specify a sender only when sending the last message */
++            if (!(flags & ((1 << ARRAY_SIZE( messages )) - 1)))
++            {
++                if (!(wait = send_hook_ll_message( desktop, msg, WH_MOUSE_LL, wparam, sender )))
++                    queue_hardware_message( desktop, msg, 0 );
++            }
++            else if (!send_hook_ll_message( desktop, msg, WH_MOUSE_LL, wparam, NULL ))
+                 queue_hardware_message( desktop, msg, 0 );
+         }
+-        else if (!send_hook_ll_message( desktop, msg, WH_MOUSE_LL, wparam, NULL ))
+-            queue_hardware_message( desktop, msg, 0 );
+     }
+     return wait;
+ }
+@@ -2692,6 +2780,8 @@ static int get_hardware_message( struct thread *thread, unsigned int hw_id, user
+     int no_legacy;
+ 
+     no_legacy = (device = thread->process->rawinput_mouse) && (device->flags & RIDEV_NOLEGACY);
++    g_ws_stats.get_hw++;
++    g_ws_stats.last_get_tid = thread->id;
+ 
+     ptr = list_head( &input->msg_list );
+     if (hw_id)
+@@ -2785,6 +2875,7 @@ static int get_hardware_message( struct thread *thread, unsigned int hw_id, user
+         if (msg_bit == QS_HARDWARE) flags |= PM_REMOVE; /* always remove internal hardware messages right away */
+         else if (!(msg_bit & (QS_RAWINPUT | QS_POINTER))) flags &= ~PM_REMOVE; /* wait for accept_hardware_message request */
+         if (flags & PM_REMOVE) release_hardware_message( current->queue, data->hw_id );
++        g_ws_stats.get_hw_ret++;
+         return 1;
+     }
+     /* nothing found, clear the hardware queue bits */
+@@ -3256,6 +3347,9 @@ DECL_HANDLER(send_hardware_message)
+     reply->new_x = desktop_shm->cursor.x;
+     reply->new_y = desktop_shm->cursor.y;
+     release_object( desktop );
++
++    g_ws_stats.send_hw_req++;
++    check_ws_stats_log();
+ }
+ 
+ /* post a quit message to the current queue */
+@@ -3388,6 +3482,9 @@ DECL_HANDLER(get_message)
+     }
+     SHARED_WRITE_END;
+ 
++    if (queue->fd && !(queue_shm->internal_bits & QS_DRIVER))
++        set_fd_events( queue->fd, POLLIN );
++
+     if (!get_queue_status( queue )) reset_sync( queue->sync );
+     else signal_sync( queue->sync );
+     set_error( STATUS_PENDING );  /* FIXME */
+@@ -3407,6 +3504,7 @@ DECL_HANDLER(reply_message)
+ /* accept the current hardware message */
+ DECL_HANDLER(accept_hardware_message)
+ {
++    g_ws_stats.accept_hw++;
+     if (current->queue)
+         release_hardware_message( current->queue, req->hw_id );
+     else
+diff --git a/server/request.c b/server/request.c
+index 5135ed5..a691414 100644
+--- a/server/request.c
++++ b/server/request.c
+@@ -279,6 +279,7 @@ static void call_req_handler( struct thread *thread )
+     memset( &reply, 0, sizeof(reply) );
+ 
+     if (debug_level) trace_request();
++    record_request_stat( req );
+ 
+     if (req < REQ_NB_REQUESTS)
+         req_handlers[req]( &current->req, &reply );
+diff --git a/server/request.h b/server/request.h
+index 68229d1..250f908 100644
+--- a/server/request.h
++++ b/server/request.h
+@@ -63,6 +63,7 @@ extern int server_dir_fd, config_dir_fd;
+ 
+ extern void trace_request(void);
+ extern void trace_reply( enum request req, const union generic_reply *reply );
++extern void record_request_stat( enum request req );
+ 
+ /* get current tick count to return to client */
+ static inline unsigned int get_tick_count(void)
+diff --git a/server/trace.c b/server/trace.c
+index b6c2f27..b34bc79 100644
+--- a/server/trace.c
++++ b/server/trace.c
+@@ -1722,3 +1722,53 @@ void trace_reply( enum request req, const union generic_reply *reply )
+     else fprintf( stderr, "%04x: %d() = %s\n",
+                   current->id, req, get_status_name(current->error) );
+ }
++
++static unsigned long req_stats[REQ_NB_REQUESTS];
++static unsigned long total_stat_reqs;
++
++struct stat_entry {
++    int id;
++    unsigned long count;
++};
++
++static int cmp_entries( const void *a, const void *b )
++{
++    const struct stat_entry *ea = a, *eb = b;
++    if (eb->count > ea->count) return 1;
++    if (eb->count < ea->count) return -1;
++    return 0;
++}
++
++void record_request_stat( enum request req )
++{
++    if (req < REQ_NB_REQUESTS)
++    {
++        req_stats[req]++;
++        total_stat_reqs++;
++        if (total_stat_reqs == 1 || (total_stat_reqs % 500 == 0))
++        {
++            FILE *f = fopen( "/tmp/wineserver_profile.txt", "w" );
++            if (f)
++            {
++                struct stat_entry entries[REQ_NB_REQUESTS];
++                int n = 0;
++                for (int i = 0; i < REQ_NB_REQUESTS; i++)
++                {
++                    if (req_stats[i] > 0)
++                    {
++                        entries[n].id = i;
++                        entries[n].count = req_stats[i];
++                        n++;
++                    }
++                }
++                qsort( entries, n, sizeof(struct stat_entry), cmp_entries );
++                fprintf( f, "Total wineserver requests: %lu\n", total_stat_reqs );
++                for (int i = 0; i < n && i < 35; i++)
++                {
++                    fprintf( f, "%-35s: %lu\n", req_names[entries[i].id], entries[i].count );
++                }
++                fclose( f );
++            }
++        }
++    }
++}

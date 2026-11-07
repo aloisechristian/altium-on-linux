@@ -1,0 +1,177 @@
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index d39a2d1..e5a4836 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -170,7 +170,7 @@ struct d2d_indexed_objects
+     size_t count;
+ };
+ 
+-#define D2D_GLYPH_CACHE_SIZE 2048
++#define D2D_GLYPH_CACHE_SIZE 8192
+ #define D2D_GEOM_CACHE_SIZE 512
+ 
+ struct d2d_glyph_cache_entry
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index daa278f..8e4ebaf 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1865,11 +1865,15 @@ static HRESULT d2d_device_context_get_glyph_run_analysis(struct d2d_device_conte
+         DWRITE_TEXT_ANTIALIAS_MODE antialias_mode, DWRITE_TEXTURE_TYPE *texture_type,
+         IDWriteGlyphRunAnalysis **result)
+ {
++    DWRITE_GLYPH_OFFSET stack_offsets[128], *heap_offsets = NULL;
++    FLOAT stack_advances[128], *heap_advances = NULL;
++    DWRITE_GLYPH_RUN scaled_run = *glyph_run;
+     IDWriteGlyphRunAnalysis *analysis;
+     IDWriteFactory2 *dwrite_factory;
+     D2D1_MATRIX_3X2_F *transform;
+-    float scale_x, scale_y;
++    float scale_x, scale_y, s;
+     DWRITE_MATRIX m;
++    UINT32 i;
+     HRESULT hr;
+ 
+     *result = NULL;
+@@ -1897,9 +1901,56 @@ static HRESULT d2d_device_context_get_glyph_run_analysis(struct d2d_device_conte
+     m.m22 = transform->_22 * scale_y;
+     m.dy  = transform->_32 * scale_y;
+ 
+-    hr = IDWriteFactory2_CreateGlyphRunAnalysis(dwrite_factory, glyph_run, &m, rendering_mode,
++    s = hypotf(m.m11, m.m12);
++    if (s > 0.0f && fabsf(s - 1.0f) > 1e-4f)
++    {
++        scaled_run.fontEmSize = max(1.0f, floorf(glyph_run->fontEmSize * s + 0.5f));
++        if (glyph_run->glyphAdvances)
++        {
++            FLOAT *adv = glyph_run->glyphCount <= 128 ? stack_advances
++                    : (heap_advances = malloc(glyph_run->glyphCount * sizeof(FLOAT)));
++            if (adv)
++            {
++                for (i = 0; i < glyph_run->glyphCount; ++i)
++                    adv[i] = glyph_run->glyphAdvances[i] * s;
++                scaled_run.glyphAdvances = adv;
++            }
++        }
++        if (glyph_run->glyphOffsets)
++        {
++            DWRITE_GLYPH_OFFSET *ofs = glyph_run->glyphCount <= 128 ? stack_offsets
++                    : (heap_offsets = malloc(glyph_run->glyphCount * sizeof(DWRITE_GLYPH_OFFSET)));
++            if (ofs)
++            {
++                for (i = 0; i < glyph_run->glyphCount; ++i)
++                {
++                    ofs[i].advanceOffset = glyph_run->glyphOffsets[i].advanceOffset * s;
++                    ofs[i].ascenderOffset = glyph_run->glyphOffsets[i].ascenderOffset * s;
++                }
++                scaled_run.glyphOffsets = ofs;
++            }
++        }
++        baseline_origin.x *= s;
++        baseline_origin.y *= s;
++        m.m11 /= s;
++        m.m12 /= s;
++        m.m21 /= s;
++        m.m22 /= s;
++        if (fabsf(m.m11 - 1.0f) < 1e-3f && fabsf(m.m12) < 1e-3f
++                && fabsf(m.m21) < 1e-3f && fabsf(m.m22 - 1.0f) < 1e-3f)
++        {
++            m.m11 = 1.0f;
++            m.m12 = 0.0f;
++            m.m21 = 0.0f;
++            m.m22 = 1.0f;
++        }
++    }
++
++    hr = IDWriteFactory2_CreateGlyphRunAnalysis(dwrite_factory, &scaled_run, &m, rendering_mode,
+             measuring_mode, DWRITE_GRID_FIT_MODE_DEFAULT, antialias_mode, baseline_origin.x,
+             baseline_origin.y, &analysis);
++    free(heap_advances);
++    free(heap_offsets);
+     if (FAILED(hr))
+     {
+         ERR("Failed to create glyph run analysis, hr %#lx.\n", hr);
+@@ -1964,6 +2015,9 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
+     m12 = transform->_12 * scale_y;
+     m22 = transform->_22 * scale_y;
+ 
++    if (glyph_run->fontEmSize * hypotf(m11, m12) < 1.0f)
++        return;
++
+     tx = floorf((baseline_origin.x * m11 + baseline_origin.y * m21 + transform->_31 * scale_x) + 0.5f);
+     ty = floorf((baseline_origin.x * m12 + baseline_origin.y * m22 + transform->_32 * scale_y) + 0.5f);
+ 
+@@ -1985,7 +2039,7 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
+     if (glyph_run->glyphOffsets)
+         hash = d2d_hash_bytes(hash, glyph_run->glyphOffsets, glyph_run->glyphCount * sizeof(DWRITE_GLYPH_OFFSET));
+ 
+-    for (step = 0; step < 4; ++step)
++    for (step = 0; step < 8; ++step)
+     {
+         struct d2d_glyph_cache_entry *e = &context->glyph_cache[(hash + step) & (D2D_GLYPH_CACHE_SIZE - 1)];
+         if (e->valid)
+@@ -2102,7 +2156,7 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
+ 
+         if (!target)
+         {
+-            idx = (hash + (context->glyph_cache_clock++ & 3)) & (D2D_GLYPH_CACHE_SIZE - 1);
++            idx = (hash + (context->glyph_cache_clock++ & 7)) & (D2D_GLYPH_CACHE_SIZE - 1);
+             target = &context->glyph_cache[idx];
+             d2d_glyph_cache_entry_clear(target);
+         }
+@@ -2190,6 +2244,7 @@ static HRESULT d2d_device_context_get_text_rendering_mode(struct d2d_device_cont
+         DWRITE_TEXT_ANTIALIAS_MODE *antialias_mode, DWRITE_RENDERING_MODE *rendering_mode)
+ {
+     IDWriteRenderingParams *rendering_params;
++    float scale, eff_em_size;
+     HRESULT hr = S_OK;
+ 
+     rendering_params = context->text_rendering_params ? context->text_rendering_params
+@@ -2249,12 +2304,14 @@ static HRESULT d2d_device_context_get_text_rendering_mode(struct d2d_device_cont
+ 
+     if (*rendering_mode == DWRITE_RENDERING_MODE_DEFAULT)
+     {
+-        if (FAILED(hr = IDWriteFontFace_GetRecommendedRenderingMode(glyph_run->fontFace, glyph_run->fontEmSize,
++        scale = hypotf(context->drawing_state.transform._11, context->drawing_state.transform._12);
++        eff_em_size = scale > 0.0f ? max(1.0f, glyph_run->fontEmSize * scale) : glyph_run->fontEmSize;
++        if (FAILED(hr = IDWriteFontFace_GetRecommendedRenderingMode(glyph_run->fontFace, eff_em_size,
+                 max(context->desc.dpiX, context->desc.dpiY) / 96.0f,
+                 measuring_mode, rendering_params, rendering_mode)))
+         {
+             ERR("Failed to get recommended rendering mode, hr %#lx.\n", hr);
+-            *rendering_mode = DWRITE_RENDERING_MODE_OUTLINE;
++            *rendering_mode = DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC;
+         }
+     }
+ 
+@@ -2293,10 +2350,10 @@ static void d2d_device_context_draw_glyph_run(struct d2d_device_context *context
+     }
+ 
+     if (rendering_mode == DWRITE_RENDERING_MODE_OUTLINE)
+-        d2d_device_context_draw_glyph_run_outline(context, baseline_origin, glyph_run, brush);
+-    else
+-        d2d_device_context_draw_glyph_run_bitmap(context, baseline_origin, glyph_run, brush,
+-                rendering_mode, measuring_mode, antialias_mode);
++        rendering_mode = DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC;
++
++    d2d_device_context_draw_glyph_run_bitmap(context, baseline_origin, glyph_run, brush,
++            rendering_mode, measuring_mode, antialias_mode);
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_DrawGlyphRun(ID2D1DeviceContext6 *iface,
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index b6903d0..04add72 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3527,6 +3527,12 @@ static BOOL d2d_geometry_check_bezier_overlap(struct d2d_geometry *geometry,
+     b[1] = &figure->bezier_controls[idx_q->control_idx];
+     b[2] = &figure->vertices[idx_q->vertex_idx + 1];
+ 
++    if (max(a[0]->x, max(a[1]->x, a[2]->x)) <= min(b[0]->x, min(b[1]->x, b[2]->x))
++            || min(a[0]->x, min(a[1]->x, a[2]->x)) >= max(b[0]->x, max(b[1]->x, b[2]->x))
++            || max(a[0]->y, max(a[1]->y, a[2]->y)) <= min(b[0]->y, min(b[1]->y, b[2]->y))
++            || min(a[0]->y, min(a[1]->y, a[2]->y)) >= max(b[0]->y, max(b[1]->y, b[2]->y)))
++        return FALSE;
++
+     if (d2d_point_ccw(a[0], a[1], a[2]) == 0.0f || d2d_point_ccw(b[0], b[1], b[2]) == 0.0f)
+         return FALSE;
+ 

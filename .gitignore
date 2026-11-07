@@ -1,0 +1,11 @@
+# Python / OS
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+.DS_Store
+
+# Temporary files
+*.tmp
+*.bak
+*.orig

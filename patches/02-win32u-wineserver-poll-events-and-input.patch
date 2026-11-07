@@ -1,0 +1,735 @@
+diff --git a/dlls/win32u/gdi_perf.h b/dlls/win32u/gdi_perf.h
+index 8dfa665..f577b65 100644
+--- a/dlls/win32u/gdi_perf.h
++++ b/dlls/win32u/gdi_perf.h
+@@ -3,8 +3,20 @@
+ 
+ #include <time.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <unistd.h>
+ 
++static inline int wine_perf_log_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        const char *env = getenv("WINE_PERF_LOG");
++        enabled = (env && env[0] && env[0] != '0') ? 1 : 0;
++    }
++    return enabled;
++}
++
+ struct gdi_stats_t
+ {
+     unsigned long polylines;
+@@ -21,9 +33,15 @@ struct gdi_stats_t
+     unsigned long hook_calls;
+     unsigned long hook_fast_hits;
+     unsigned long wfp_fast_hits;
++    unsigned long hw_mouse_inputs;
++    unsigned long accum_sends;
++    unsigned long set_cursor_calls;
++    unsigned long timer_dispatches;
+     unsigned long long time_ns;
+     unsigned long long flush_ns;
+     unsigned long long paint_app_ns;
++    unsigned long long mousemove_ns;
++    unsigned long long wait_ns;
+ };
+ 
+ extern struct gdi_stats_t g_gdi_stats;
+@@ -44,21 +62,28 @@ static inline void record_gdi_time(unsigned long long start_ns)
+ 
+     if (now - last_report >= 1000000000ULL)
+     {
+-        if (g_gdi_stats.polylines || g_gdi_stats.polygons || g_gdi_stats.rects ||
+-            g_gdi_stats.texts || g_gdi_stats.bitblts || g_gdi_stats.scrolls || g_gdi_stats.flushes ||
+-            g_gdi_stats.endpaints || g_gdi_stats.mousemoves || g_gdi_stats.invalidates)
++        if (wine_perf_log_enabled() &&
++            (g_gdi_stats.polylines || g_gdi_stats.polygons || g_gdi_stats.rects ||
++             g_gdi_stats.texts || g_gdi_stats.bitblts || g_gdi_stats.scrolls || g_gdi_stats.flushes ||
++             g_gdi_stats.endpaints || g_gdi_stats.mousemoves || g_gdi_stats.invalidates))
+         {
+             FILE *f = fopen("/tmp/wine_gdi_stats.log", "a");
+             if (f)
+             {
+-                fprintf(f, "[GDI_STATS pid=%d] gdi=%.1fms flush=%.1fms app_draw=%.1fms | mousemoves=%lu invalidates=%lu endpaints=%lu | hook_fast=%lu/%lu wfp_fast=%lu\n",
++                fprintf(f, "[GDI_STATS pid=%d] gdi=%.1fms flush=%.1fms app_draw=%.1fms mm_proc=%.1fms wait=%.1fms | mm=%lu inv=%lu paint=%lu | hw_in=%lu accum_send=%lu set_cursor=%lu timer=%lu | hook_fast=%lu/%lu wfp_fast=%lu\n",
+                         getpid(),
+                         g_gdi_stats.time_ns / 1000000.0,
+                         g_gdi_stats.flush_ns / 1000000.0,
+                         g_gdi_stats.paint_app_ns / 1000000.0,
++                        g_gdi_stats.mousemove_ns / 1000000.0,
++                        g_gdi_stats.wait_ns / 1000000.0,
+                         g_gdi_stats.mousemoves,
+                         g_gdi_stats.invalidates,
+                         g_gdi_stats.endpaints,
++                        g_gdi_stats.hw_mouse_inputs,
++                        g_gdi_stats.accum_sends,
++                        g_gdi_stats.set_cursor_calls,
++                        g_gdi_stats.timer_dispatches,
+                         g_gdi_stats.hook_fast_hits,
+                         g_gdi_stats.hook_calls,
+                         g_gdi_stats.wfp_fast_hits);
+@@ -79,9 +104,15 @@ static inline void record_gdi_time(unsigned long long start_ns)
+         g_gdi_stats.hook_calls = 0;
+         g_gdi_stats.hook_fast_hits = 0;
+         g_gdi_stats.wfp_fast_hits = 0;
++        g_gdi_stats.hw_mouse_inputs = 0;
++        g_gdi_stats.accum_sends = 0;
++        g_gdi_stats.set_cursor_calls = 0;
++        g_gdi_stats.timer_dispatches = 0;
+         g_gdi_stats.time_ns = 0;
+         g_gdi_stats.flush_ns = 0;
+         g_gdi_stats.paint_app_ns = 0;
++        g_gdi_stats.mousemove_ns = 0;
++        g_gdi_stats.wait_ns = 0;
+         last_report = now;
+     }
+ }
+diff --git a/dlls/win32u/input.c b/dlls/win32u/input.c
+index c24bbab..712a857 100644
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -36,6 +36,7 @@
+ #include "wine/server.h"
+ #include "wine/debug.h"
+ #include "kbd.h"
++#include "gdi_perf.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(win);
+ WINE_DECLARE_DEBUG_CHANNEL(keyboard);
+@@ -692,6 +693,7 @@ static NTSTATUS send_mouse_motion( UINT flags )
+ 
+     if (!input.mi.dwFlags && !input.mi.mouseData && !info->raw_mouse.count) return STATUS_SUCCESS; /* ignore empty inputs */
+ 
++    g_gdi_stats.accum_sends++;
+     TRACE( "Sending %s (%u raw frames)\n", debugstr_mouseinput( &input.mi ), info->raw_mouse.count );
+     status = server_send_hardware_message( info->mouse_hwnd, flags, &input, (LPARAM)&info->raw_mouse );
+     memset( &info->mouse_motion, 0, sizeof(info->mouse_motion) );
+@@ -746,8 +748,9 @@ NTSTATUS send_hardware_input( HWND hwnd, UINT flags, const INPUT *input, LPARAM
+ {
+     if (input->type == INPUT_MOUSE)
+     {
+-        const struct raw_mouse empty_raw = {0}, *raw = lparam ? (void *)lparam : &empty_raw;
+-        return accum_mouse_motion( hwnd, flags, *input, raw );
++        g_gdi_stats.hw_mouse_inputs++;
++        g_gdi_stats.accum_sends++;
++        return server_send_hardware_message( hwnd, flags, input, lparam );
+     }
+ 
+     return server_send_hardware_message( hwnd, flags, input, lparam );
+@@ -815,6 +818,8 @@ BOOL WINAPI NtUserSetCursorPos( INT x, INT y )
+     BOOL ret;
+     INT prev_x, prev_y, new_x, new_y;
+ 
++    g_gdi_stats.set_cursor_calls++;
++
+     rect = map_rect_virt_to_raw( rect, get_thread_dpi() );
+     SERVER_START_REQ( set_cursor )
+     {
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index 5ecf744..84a6dfa 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2589,6 +2589,64 @@ static WORD pointer_buttons_from_mouse_buttons( WORD mouse_flags )
+     return pointer_flags;
+ }
+ 
++struct drop_debug_stats
++{
++    unsigned long hw_msgs;
++    unsigned long hw_rawinput;
++    unsigned long hw_kbd;
++    unsigned long hw_mouse;
++    unsigned long hw_pointer;
++    unsigned long hw_clipcursor;
++    unsigned long hw_setcursor;
++    unsigned long hw_other;
++    unsigned long drop_no_wnd;
++    unsigned long drop_filter;
++    unsigned long drop_range;
++    unsigned long drop_hook;
++    unsigned long drop_nowhere;
++    unsigned long drop_eat;
++    unsigned long ok_mouse;
++    unsigned long hw_ret_1;
++    unsigned long hw_drop;
++    HWND last_msg_hwnd;
++    HWND last_filter_hwnd;
++    UINT last_msg_id;
++    UINT last_first;
++    UINT last_last;
++};
++static struct drop_debug_stats g_drop_stats;
++
++static void log_drop_stats(void)
++{
++    static unsigned long long last_log = 0;
++    unsigned long long now;
++    if (!wine_perf_log_enabled()) return;
++    now = get_time_ns();
++    if (now - last_log >= 1000000000ULL)
++    {
++        last_log = now;
++        if (g_drop_stats.hw_msgs || g_drop_stats.hw_drop || g_drop_stats.hw_ret_1)
++        {
++            FILE *f = fopen( "/tmp/wine_drop_debug.log", "a" );
++            if (f)
++            {
++                fprintf( f, "[DROP_DEBUG pid=%d tid=%04x] hw_total=%lu (raw=%lu kbd=%lu mouse=%lu ptr=%lu clip=%lu setcur=%lu oth=%lu) | drops: no_wnd=%lu(last=%p) filter=%lu(msg=%p flt=%p) range=%lu(id=%x [%x..%x]) hook=%lu nwhr=%lu eat=%lu | ok_mouse=%lu hw_ret_1=%lu hw_drop=%lu\n",
++                         getpid(), GetCurrentThreadId(),
++                         g_drop_stats.hw_msgs, g_drop_stats.hw_rawinput, g_drop_stats.hw_kbd,
++                         g_drop_stats.hw_mouse, g_drop_stats.hw_pointer, g_drop_stats.hw_clipcursor,
++                         g_drop_stats.hw_setcursor, g_drop_stats.hw_other,
++                         g_drop_stats.drop_no_wnd, g_drop_stats.last_msg_hwnd,
++                         g_drop_stats.drop_filter, g_drop_stats.last_msg_hwnd, g_drop_stats.last_filter_hwnd,
++                         g_drop_stats.drop_range, g_drop_stats.last_msg_id, g_drop_stats.last_first, g_drop_stats.last_last,
++                         g_drop_stats.drop_hook, g_drop_stats.drop_nowhere, g_drop_stats.drop_eat,
++                         g_drop_stats.ok_mouse, g_drop_stats.hw_ret_1, g_drop_stats.hw_drop );
++                fclose( f );
++            }
++            memset( &g_drop_stats, 0, sizeof(g_drop_stats) );
++        }
++    }
++}
++
+ /***********************************************************************
+  *          process_mouse_message
+  *
+@@ -2636,6 +2694,8 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+ 
+     if (!msg->hwnd || !is_current_thread_window( msg->hwnd ))
+     {
++        g_drop_stats.drop_no_wnd++;
++        g_drop_stats.last_msg_hwnd = msg->hwnd;
+         accept_hardware_message( hw_id );
+         return FALSE;
+     }
+@@ -2716,7 +2776,13 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+     event.paramH  = msg->pt.y;
+     call_hooks( WH_JOURNALRECORD, HC_ACTION, 0, (LPARAM)&event, sizeof(event) );
+ 
+-    if (!check_hwnd_filter( msg, hwnd_filter )) return FALSE;
++    if (!check_hwnd_filter( msg, hwnd_filter ))
++    {
++        g_drop_stats.drop_filter++;
++        g_drop_stats.last_msg_hwnd = msg->hwnd;
++        g_drop_stats.last_filter_hwnd = hwnd_filter;
++        return FALSE;
++    }
+ 
+     pt = msg->pt;
+     message = msg->message;
+@@ -2771,13 +2837,27 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+                }
+            }
+         }
+-        if (message < first || message > last) return FALSE;
++        if (message < first || message > last)
++        {
++            g_drop_stats.drop_range++;
++            g_drop_stats.last_msg_id = message;
++            g_drop_stats.last_first = first;
++            g_drop_stats.last_last = last;
++            return FALSE;
++        }
+         /* update static double click conditions */
+         if (update) clk_msg = *msg;
+     }
+     else
+     {
+-        if (message < first || message > last) return FALSE;
++        if (message < first || message > last)
++        {
++            g_drop_stats.drop_range++;
++            g_drop_stats.last_msg_id = message;
++            g_drop_stats.last_first = first;
++            g_drop_stats.last_last = last;
++            return FALSE;
++        }
+     }
+     msg->wParam = wparam;
+ 
+@@ -2790,6 +2870,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+     hook.mouseData    = msg->wParam;
+     if (call_hooks( WH_MOUSE, remove ? HC_ACTION : HC_NOREMOVE, message, (LPARAM)&hook, sizeof(hook) ))
+     {
++        g_drop_stats.drop_hook++;
+         hook.pt           = msg->pt;
+         hook.hwnd         = msg->hwnd;
+         hook.wHitTestCode = hittest;
+@@ -2802,6 +2883,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+ 
+     if ((hittest == HTERROR) || (hittest == HTNOWHERE))
+     {
++        g_drop_stats.drop_nowhere++;
+         send_message( msg->hwnd, WM_SETCURSOR, (WPARAM)msg->hwnd, MAKELONG( hittest, msg->message ));
+         accept_hardware_message( hw_id );
+         return FALSE;
+@@ -2811,6 +2893,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+ 
+     if (!remove || info.hwndCapture)
+     {
++        g_drop_stats.ok_mouse++;
+         msg->message = message;
+         return TRUE;
+     }
+@@ -2867,6 +2950,8 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+     send_message( msg->hwnd, WM_SETCURSOR, (WPARAM)msg->hwnd, MAKELONG( hittest, msg->message ));
+ 
+     msg->message = message;
++    if (eat_msg) g_drop_stats.drop_eat++;
++    else g_drop_stats.ok_mouse++;
+     return !eat_msg;
+ }
+ 
+@@ -2895,20 +2980,42 @@ static BOOL process_hardware_message( MSG *msg, UINT hw_id, const struct hardwar
+     msg->pt.x = rect.left;
+     msg->pt.y = rect.top;
+ 
++    g_drop_stats.hw_msgs++;
+     if (msg->message == WM_INPUT || msg->message == WM_INPUT_DEVICE_CHANGE)
++    {
++        g_drop_stats.hw_rawinput++;
+         ret = process_rawinput_message( msg, hw_id, msg_data );
++    }
+     else if (is_keyboard_message( msg->message ))
++    {
++        g_drop_stats.hw_kbd++;
+         ret = process_keyboard_message( msg, hw_id, hwnd_filter, first, last, remove );
++    }
+     else if (is_mouse_message( msg->message ))
++    {
++        g_drop_stats.hw_mouse++;
+         ret = process_mouse_message( msg, hw_id, msg_data->info, hwnd_filter, first, last, remove );
++    }
+     else if (msg->message >= WM_POINTERUPDATE && msg->message <= WM_POINTERLEAVE)
++    {
++        g_drop_stats.hw_pointer++;
+         ret = process_pointer_message( msg, hw_id, msg_data );
++    }
+     else if (msg->message == WM_WINE_CLIPCURSOR)
++    {
++        g_drop_stats.hw_clipcursor++;
+         process_wine_clipcursor( msg->hwnd, msg->wParam, msg->lParam );
++    }
+     else if (msg->message == WM_WINE_SETCURSOR)
++    {
++        g_drop_stats.hw_setcursor++;
+         process_wine_setcursor( msg->hwnd, (HWND)msg->wParam, (HCURSOR)msg->lParam );
++    }
+     else
++    {
++        g_drop_stats.hw_other++;
+         ERR( "unknown message type %x\n", msg->message );
++    }
+     set_thread_dpi_awareness_context( context );
+     if (!ret) thread_info->client_info->msg_source = prev_source;
+     return ret;
+@@ -3031,6 +3138,7 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
+             if (buffer != buffer_init) free( buffer );
+             if (res == STATUS_PENDING)
+             {
++                log_drop_stats();
+                 if (hwnd == (HWND)-1 && idle_event) NtSetEvent( idle_event, NULL );
+                 return 0;
+             }
+@@ -3166,9 +3274,13 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
+                 if (!process_hardware_message( &info.msg, hw_id, &msg_data->hardware,
+                                                hwnd, first, last, flags & PM_REMOVE ))
+                 {
++                    g_drop_stats.hw_drop++;
++                    log_drop_stats();
+                     TRACE("dropping msg %x\n", info.msg.message );
+                     continue;  /* ignore it */
+                 }
++                g_drop_stats.hw_ret_1++;
++                log_drop_stats();
+                 *msg = info.msg;
+                 thread_info->message_pos   = MAKELONG( info.msg.pt.x, info.msg.pt.y );
+                 thread_info->message_time  = info.msg.time;
+@@ -3346,15 +3458,16 @@ static BOOL check_internal_bits( UINT mask )
+ 
+ static BOOL process_driver_events( UINT events_mask, UINT wake_mask, UINT changed_mask )
+ {
++    BOOL had_driver = check_internal_bits( QS_DRIVER );
+     BOOL drained = FALSE;
+ 
+-    if (check_internal_bits( QS_DRIVER )) drained = user_driver->pProcessEvents( events_mask );
++    if (had_driver) drained = user_driver->pProcessEvents( events_mask );
+ 
+-    if (drained || !check_queue_masks( wake_mask, changed_mask ))
++    if (had_driver || drained || !check_queue_masks( wake_mask, changed_mask ))
+     {
+         SERVER_START_REQ( set_queue_mask )
+         {
+-            req->poll_events = drained;
++            req->poll_events = TRUE; /* ALWAYS re-arm POLLIN on queue->fd so Wineserver epoll wakes us up on mouse movement! */
+             req->wake_mask = wake_mask;
+             req->changed_mask = changed_mask;
+             wine_server_call( req );
+@@ -3415,6 +3528,8 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
+     ULONG ret_len;
+     HANDLE event;
+     DWORD ret;
++    unsigned long long wait_t0, wait_dur;
++    int iter = 0;
+ 
+     if ((abs = get_nt_timeout( &time, timeout )))
+     {
+@@ -3432,8 +3547,27 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
+     process_driver_events( QS_ALLINPUT, wake_mask, changed_mask );
+     if (!(changed_mask & QS_SMRESULT) && (event = get_user_thread_info()->idle_event)) NtSetEvent( event, NULL );
+ 
+-    do ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), abs );
++    wait_t0 = get_time_ns();
++    do
++    {
++        iter++;
++        ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), abs );
++    }
+     while (ret == count - 1 && !process_driver_events( QS_ALLINPUT, wake_mask, changed_mask ));
++    wait_dur = get_time_ns() - wait_t0;
++    g_gdi_stats.wait_ns += wait_dur;
++
++    if (wine_perf_log_enabled() && wait_dur > 20000000ULL)
++    {
++        FILE *f = fopen("/tmp/wine_wait_debug.log", "a");
++        if (f)
++        {
++            fprintf(f, "[WAIT_DEBUG tid=%04x] dur=%.1fms count=%u ret=%x iter=%d timeout=%u wake_mask=%x chg_mask=%x\n",
++                    GetCurrentThreadId(), wait_dur / 1000000.0, (unsigned)count, (unsigned)ret, iter, (unsigned)timeout,
++                    (unsigned)wake_mask, (unsigned)changed_mask);
++            fclose(f);
++        }
++    }
+ 
+     if (HIWORD(ret)) /* is it an error code? */
+     {
+@@ -3942,6 +4076,7 @@ NTSTATUS server_send_hardware_message( HWND hwnd, UINT flags, const INPUT *input
+             req->input.mouse.flags = input->mi.dwFlags;
+             req->input.mouse.time  = input->mi.time;
+             req->input.mouse.info  = input->mi.dwExtraInfo;
++            req->input.mouse.raw_count = 0;
+             if (lparam)
+             {
+                 struct raw_mouse *raw = (struct raw_mouse *)lparam;
+@@ -3997,6 +4132,23 @@ NTSTATUS server_send_hardware_message( HWND hwnd, UINT flags, const INPUT *input
+             break;
+         }
+         ret = wine_server_call( req );
++        if (ret)
++        {
++            static unsigned long long last_err_time = 0;
++            static unsigned long err_count = 0;
++            unsigned long long now_err = get_time_ns();
++            err_count++;
++            if (now_err - last_err_time > 1000000000ULL)
++            {
++                FILE *f = fopen("/tmp/wine_client_err.log", "a");
++                last_err_time = now_err;
++                if (f)
++                {
++                    fprintf(f, "[CLIENT_ERR] server_send_hw returned %x count=%lu\n", (unsigned)ret, err_count);
++                    fclose(f);
++                }
++            }
++        }
+         wait = reply->wait;
+         prev_x = reply->prev_x;
+         prev_y = reply->prev_y;
+@@ -4038,6 +4190,7 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
+ {
+     struct win_proc_params params;
+     LRESULT retval = 0;
++    unsigned long long mm_t0 = 0;
+ 
+     /* Process timer messages */
+     if (msg->lParam && msg->message == WM_TIMER)
+@@ -4066,12 +4219,17 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
+ 
+     spy_enter_message( SPY_DISPATCHMESSAGE, msg->hwnd, msg->message, msg->wParam, msg->lParam );
+ 
++    if (msg->message == WM_MOUSEMOVE) mm_t0 = get_time_ns();
++    if (msg->message == WM_TIMER || msg->message == WM_SYSTIMER) g_gdi_stats.timer_dispatches++;
++
+     if (init_window_call_params( &params, msg->hwnd, msg->message, msg->wParam, msg->lParam,
+                                  FALSE, WMCHAR_MAP_DISPATCHMESSAGE ))
+         retval = dispatch_win_proc_params( &params, sizeof(params), NULL, NULL );
+     else if (!is_window( msg->hwnd )) RtlSetLastWin32Error( ERROR_INVALID_WINDOW_HANDLE );
+     else RtlSetLastWin32Error( ERROR_MESSAGE_SYNC_ONLY );
+ 
++    if (mm_t0) g_gdi_stats.mousemove_ns += (get_time_ns() - mm_t0);
++
+     spy_exit_message( SPY_RESULT_OK, msg->hwnd, msg->message, retval, msg->wParam, msg->lParam );
+ 
+     if (msg->message == WM_PAINT)
+diff --git a/server/queue.c b/server/queue.c
+index 2449f0c..0a56586 100644
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -199,6 +199,54 @@ static unsigned int cursor_history_latest;
+ static void queue_hardware_message( struct desktop *desktop, struct message *msg, int always_queue );
+ static void free_message( struct message *msg );
+ 
++struct ws_stats
++{
++    unsigned long send_hw_req;
++    unsigned long mouse_in;
++    unsigned long raw_err;
++    unsigned long no_move;
++    unsigned long q_hw;
++    unsigned long no_target;
++    unsigned long q_merged;
++    unsigned long q_added;
++    unsigned long get_hw;
++    unsigned long get_hw_ret;
++    unsigned long accept_hw;
++    unsigned int last_q_tid;
++    user_handle_t last_q_win;
++    unsigned int last_get_tid;
++};
++static struct ws_stats g_ws_stats;
++
++static void check_ws_stats_log(void)
++{
++    static int enabled = -1;
++    static timeout_t last_log = 0;
++    FILE *f;
++    if (enabled < 0)
++    {
++        const char *env = getenv("WINE_PERF_LOG");
++        enabled = (env && env[0] && env[0] != '0') ? 1 : 0;
++    }
++    if (!enabled) return;
++    if (monotonic_time - last_log > TICKS_PER_SEC)
++    {
++        last_log = monotonic_time;
++        f = fopen("/tmp/wine_ws_pipe.log", "a");
++        if (f)
++        {
++            fprintf(f, "[WS_PIPE] send_hw=%lu mouse_in=%lu raw_err=%lu no_move=%lu | q_hw=%lu no_target=%lu merged=%lu added=%lu (q_tid=%04x q_win=%08x) | get_hw=%lu ret=%lu accept=%lu (get_tid=%04x)\n",
++                    g_ws_stats.send_hw_req, g_ws_stats.mouse_in, g_ws_stats.raw_err, g_ws_stats.no_move,
++                    g_ws_stats.q_hw, g_ws_stats.no_target, g_ws_stats.q_merged, g_ws_stats.q_added,
++                    g_ws_stats.last_q_tid, g_ws_stats.last_q_win,
++                    g_ws_stats.get_hw, g_ws_stats.get_hw_ret, g_ws_stats.accept_hw,
++                    g_ws_stats.last_get_tid);
++            fclose(f);
++        }
++        memset(&g_ws_stats, 0, sizeof(g_ws_stats));
++    }
++}
++
+ /* set the caret window in a given thread input, requires write lock on the thread input shared member */
+ static void set_caret_window( struct thread_input *input, input_shm_t *shared, user_handle_t win )
+ {
+@@ -820,6 +868,7 @@ static struct message *find_mouse_message( struct thread_input *input, const str
+         if (prev->msg != WM_INPUT) break;
+     }
+     if (!ptr) return NULL;
++    if (prev->unique_id) return NULL; /* don't merge into a message already in flight to the client */
+     if (prev->result) return NULL;
+     if (prev->win && msg->win && prev->win != msg->win) return NULL;
+     if (prev->msg != msg->msg) return NULL;
+@@ -1782,10 +1831,18 @@ static user_handle_t find_hardware_message_window( struct desktop *desktop, stru
+         break;
+     case QS_MOUSEMOVE:
+     case QS_MOUSEBUTTON:
++        if (desktop->foreground_input && (win = desktop->foreground_input->shared->capture))
++        {
++            *thread = get_window_thread( win );
++            break;
++        }
+         if (!input || !(win = input_shm->capture))
+         {
+-            if (is_window_visible( msg->win ) && !is_window_transparent( msg->win )) win = msg->win;
+-            else win = shallow_window_from_point( desktop, msg->x, msg->y );
++            user_handle_t top_handle = get_desktop_top_window( desktop );
++            if (msg->win && msg->win != top_handle && is_window_visible( msg->win ) && !is_window_transparent( msg->win ))
++                win = msg->win;
++            else
++                win = shallow_window_from_point( desktop, msg->x, msg->y );
+             *thread = window_thread_from_point( win, msg->x, msg->y );
+         }
+         break;
+@@ -1836,7 +1893,7 @@ static unsigned int get_rawinput_device_flags( struct process *process, struct m
+ static void queue_hardware_message( struct desktop *desktop, struct message *msg, int always_queue )
+ {
+     desktop_shm_t *desktop_shm = desktop->shared;
+-    user_handle_t win;
++    user_handle_t win, top_handle;
+     struct thread *thread;
+     struct thread_input *input;
+     struct hardware_msg_data *msg_data = msg->data;
+@@ -1872,7 +1929,12 @@ static void queue_hardware_message( struct desktop *desktop, struct message *msg
+     msg->x = desktop_shm->cursor.x;
+     msg->y = desktop_shm->cursor.y;
+ 
+-    if (msg->win && (thread = get_window_thread( msg->win )))
++    top_handle = get_desktop_top_window( desktop );
++    if (desktop->foreground_input && desktop->foreground_input->shared->capture)
++    {
++        input = desktop->foreground_input;
++    }
++    else if (msg->win && msg->win != top_handle && (thread = get_window_thread( msg->win )))
+     {
+         input = thread->queue->input;
+         release_object( thread );
+@@ -1885,18 +1947,31 @@ static void queue_hardware_message( struct desktop *desktop, struct message *msg
+     if (input && (get_hardware_msg_bit( msg->msg ) & (QS_KEY | QS_MOUSEBUTTON)))
+         input->user_time = monotonic_time;
+ 
++    g_ws_stats.q_hw++;
+     if (!win || !thread || (flags & RIDEV_NOLEGACY))
+     {
++        g_ws_stats.no_target++;
+         if (input && !(flags & RIDEV_NOLEGACY)) update_thread_input_key_state( input, msg->msg, msg->wparam );
+         free_message( msg );
+         if (thread) release_object( thread );
+         return;
+     }
+ 
++    g_ws_stats.last_q_tid = thread->id;
++    g_ws_stats.last_q_win = win;
++
+     if (win != msg->win) always_queue = 1;
+-    if (!always_queue || merge_message( input, msg )) free_message( msg );
++    msg->win = win;
++
++    if (!always_queue || merge_message( input, msg ))
++    {
++        g_ws_stats.q_merged++;
++        set_queue_bits( thread->queue, msg_bit );
++        free_message( msg );
++    }
+     else
+     {
++        g_ws_stats.q_added++;
+         msg->unique_id = 0;  /* will be set once we return it to the app */
+         list_add_tail( &input->msg_list, &msg->entry );
+         set_queue_bits( thread->queue, msg_bit );
+@@ -2195,8 +2270,10 @@ static int queue_mouse_message( struct desktop *desktop, user_handle_t win, cons
+         WM_MOUSEHWHEEL   /* 0x1000 = MOUSEEVENTF_HWHEEL */
+     };
+ 
++    g_ws_stats.mouse_in++;
+     if (input->mouse.raw_count != get_req_data_size() / sizeof(*raw))
+     {
++        g_ws_stats.raw_err++;
+         set_error( STATUS_INVALID_PARAMETER );
+         return 0;
+     }
+@@ -2234,7 +2311,10 @@ static int queue_mouse_message( struct desktop *desktop, user_handle_t win, cons
+             y = desktop_shm->cursor.y + input->mouse.y;
+         }
+         if (x == desktop_shm->cursor.x && y == desktop_shm->cursor.y)
++        {
++            g_ws_stats.no_move++;
+             flags &= ~MOUSEEVENTF_MOVE;
++        }
+     }
+     else
+     {
+@@ -2284,14 +2364,22 @@ static int queue_mouse_message( struct desktop *desktop, user_handle_t win, cons
+         msg->mergeable = !(flags & MOUSEEVENTF_MOVE_NOCOALESCE);
+         if (origin == IMO_INJECTED) msg_data->flags = LLMHF_INJECTED;
+ 
+-        /* specify a sender only when sending the last message */
+-        if (!(flags & ((1 << ARRAY_SIZE( messages )) - 1)))
++        /* For WM_MOUSEMOVE, queue immediately to prevent low-level hook stalls and latency */
++        if (messages[i] == WM_MOUSEMOVE)
++        {
++            queue_hardware_message( desktop, msg, 0 );
++        }
++        else
+         {
+-            if (!(wait = send_hook_ll_message( desktop, msg, WH_MOUSE_LL, wparam, sender )))
++            /* specify a sender only when sending the last message */
++            if (!(flags & ((1 << ARRAY_SIZE( messages )) - 1)))
++            {
++                if (!(wait = send_hook_ll_message( desktop, msg, WH_MOUSE_LL, wparam, sender )))
++                    queue_hardware_message( desktop, msg, 0 );
++            }
++            else if (!send_hook_ll_message( desktop, msg, WH_MOUSE_LL, wparam, NULL ))
+                 queue_hardware_message( desktop, msg, 0 );
+         }
+-        else if (!send_hook_ll_message( desktop, msg, WH_MOUSE_LL, wparam, NULL ))
+-            queue_hardware_message( desktop, msg, 0 );
+     }
+     return wait;
+ }
+@@ -2692,6 +2780,8 @@ static int get_hardware_message( struct thread *thread, unsigned int hw_id, user
+     int no_legacy;
+ 
+     no_legacy = (device = thread->process->rawinput_mouse) && (device->flags & RIDEV_NOLEGACY);
++    g_ws_stats.get_hw++;
++    g_ws_stats.last_get_tid = thread->id;
+ 
+     ptr = list_head( &input->msg_list );
+     if (hw_id)
+@@ -2785,6 +2875,7 @@ static int get_hardware_message( struct thread *thread, unsigned int hw_id, user
+         if (msg_bit == QS_HARDWARE) flags |= PM_REMOVE; /* always remove internal hardware messages right away */
+         else if (!(msg_bit & (QS_RAWINPUT | QS_POINTER))) flags &= ~PM_REMOVE; /* wait for accept_hardware_message request */
+         if (flags & PM_REMOVE) release_hardware_message( current->queue, data->hw_id );
++        g_ws_stats.get_hw_ret++;
+         return 1;
+     }
+     /* nothing found, clear the hardware queue bits */
+@@ -3256,6 +3347,9 @@ DECL_HANDLER(send_hardware_message)
+     reply->new_x = desktop_shm->cursor.x;
+     reply->new_y = desktop_shm->cursor.y;
+     release_object( desktop );
++
++    g_ws_stats.send_hw_req++;
++    check_ws_stats_log();
+ }
+ 
+ /* post a quit message to the current queue */
+@@ -3388,6 +3482,9 @@ DECL_HANDLER(get_message)
+     }
+     SHARED_WRITE_END;
+ 
++    if (queue->fd && !(queue_shm->internal_bits & QS_DRIVER))
++        set_fd_events( queue->fd, POLLIN );
++
+     if (!get_queue_status( queue )) reset_sync( queue->sync );
+     else signal_sync( queue->sync );
+     set_error( STATUS_PENDING );  /* FIXME */
+@@ -3407,6 +3504,7 @@ DECL_HANDLER(reply_message)
+ /* accept the current hardware message */
+ DECL_HANDLER(accept_hardware_message)
+ {
++    g_ws_stats.accept_hw++;
+     if (current->queue)
+         release_hardware_message( current->queue, req->hw_id );
+     else
+diff --git a/server/user.h b/server/user.h
+index f1a1f07..dbf8e7b 100644
+--- a/server/user.h
++++ b/server/user.h
+@@ -181,6 +181,7 @@ extern int is_window_transparent( user_handle_t window );
+ extern int make_window_active( user_handle_t window );
+ extern struct thread *get_window_thread( user_handle_t handle );
+ extern user_handle_t shallow_window_from_point( struct desktop *desktop, int x, int y );
++extern user_handle_t get_desktop_top_window( struct desktop *desktop );
+ extern struct thread *window_thread_from_point( user_handle_t scope, int x, int y );
+ extern user_handle_t find_window_to_repaint( user_handle_t parent, struct thread *thread );
+ extern struct window_class *get_window_class( user_handle_t window );
+diff --git a/server/window.c b/server/window.c
+index 3cd82b0..0adbd32 100644
+--- a/server/window.c
++++ b/server/window.c
+@@ -1055,6 +1055,11 @@ user_handle_t shallow_window_from_point( struct desktop *desktop, int x, int y )
+     return desktop->top_window->handle;
+ }
+ 
++user_handle_t get_desktop_top_window( struct desktop *desktop )
++{
++    return desktop->top_window ? desktop->top_window->handle : 0;
++}
++
+ /* return thread of top-most window containing point (in absolute raw coords) */
+ struct thread *window_thread_from_point( user_handle_t scope, int x, int y )
+ {

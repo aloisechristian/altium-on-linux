@@ -1,0 +1,77 @@
+name: Build Patched Wine DLLs
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'patches/**'
+      - '.github/workflows/build-wine.yml'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo dpkg --add-architecture i386 || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc-mingw-w64 flex bison \
+            libx11-dev libfreetype-dev libvulkan-dev \
+            git python3 pkg-config
+
+      - name: Clone Wine source
+        run: |
+          git clone --depth 1 --branch wine-11.20 https://gitlab.winehq.org/wine/wine.git wine-src || \
+          git clone --depth 1 --branch master https://gitlab.winehq.org/wine/wine.git wine-src
+
+      - name: Apply patches
+        run: |
+          cd wine-src
+          git apply ../patches/00-full-wine-11.20-altium-fluid.patch || {
+            echo "Applying individual patches..."
+            git apply ../patches/01-d2d1-schematic-glyph-cache-and-scale-fix.patch
+            git apply ../patches/02-win32u-wineserver-poll-events-and-input.patch
+          }
+
+      - name: Configure Wine
+        run: |
+          mkdir build64
+          cd build64
+          ../wine-src/configure --enable-win64 --without-x --without-pulse --without-alsa
+
+      - name: Build d2d1.dll, win32u.so and wineserver
+        run: |
+          cd build64
+          make -j$(nproc) dlls/d2d1
+          make -j$(nproc) dlls/win32u
+          make -j$(nproc) server
+
+      - name: Patch DOS Stub in d2d1.dll
+        run: |
+          python3 -c '
+          p = "build64/dlls/d2d1/x86_64-windows/d2d1.dll"
+          data = bytearray(open(p, "rb").read())
+          data[0x40:0x60] = b"\x0e\x1f\xba\x0e\x00\xb4\x09\xcd\x21\xb8\x01\x4c\xcd\x21This program cannot be run in DOS mode.\r\r\n$\x00\x00\x00\x00\x00\x00\x00"[:32]
+          open(p, "wb").write(data)
+          '
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist/binaries/x86_64-windows dist/binaries/x86_64-unix
+          cp -f build64/dlls/d2d1/x86_64-windows/d2d1.dll dist/binaries/x86_64-windows/
+          cp -f build64/dlls/win32u/win32u.so dist/binaries/x86_64-unix/
+          cp -f build64/server/wineserver dist/binaries/x86_64-unix/
+          tar -czvf altium-wine-binaries-linux-x86_64.tar.gz -C dist .
+
+      - name: Upload binaries artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: altium-wine-binaries
+          path: altium-wine-binaries-linux-x86_64.tar.gz
