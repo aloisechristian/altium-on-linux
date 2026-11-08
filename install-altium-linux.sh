@@ -411,6 +411,17 @@ EOF
 # Limita i thread di compilazione shader Vulkan per evitare picchi di RAM massicci su CPU multi-core
 dxvk.numCompilerThreads = 2
 
+# Limita il framerate massimo a 60 FPS per evitare picchi a migliaia di FPS nei dialoghi/anteprime ECO
+dxvk.maxFrameRate = 60
+dxgi.maxFrameRate = 60
+
+# Riduci il numero di backbuffer da 5 a 2 per risparmiare VRAM sui 2GB della GPU
+dxgi.numBackBuffers = 2
+d3d9.numBackBuffers = 2
+
+# Riutilizzo aggressivo della memoria VRAM durante la rigenerazione di poligoni e modelli 3D
+dxvk.allowMemoryReuse = True
+
 # Ottimizzazione latenza presentazione e ridisegno immediato per CAD desktop (elimina il ritardo di ridisegno / box di selezione)
 dxgi.syncInterval = 0
 d3d11.syncInterval = 0
@@ -419,6 +430,8 @@ dxgi.maxFrameLatency = 1
 d3d11.maxFrameLatency = 1
 d3d9.maxFrameLatency = 1
 dxgi.tearFree = False
+dxgi.deferSurfaceCreation = True
+d3d9.deferSurfaceCreation = True
 EOF
 
     log_info "Creazione dello script di avvio in: $LAUNCHER_SCRIPT"
