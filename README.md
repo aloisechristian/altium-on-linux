@@ -83,7 +83,7 @@ Make sure your system has the standard Wine dependencies installed:
 7. **Simulation Hover Flood**:
    Patches `AdvSim.dll` from triggering thousands of recursive `WindowFromPoint` and hook queries on mouse move.
 8. **SamacSys Altium Library Loader (`AltiumLL.vbs`)**:
-   Fixes `Permission Denied` and VBScript Base64 character conversion bugs in Wine.
+   Fixes `Permission Denied`, VBScript Base64 character conversion bugs in Wine, missing `Set` keywords on `PCBServer`/COM object assignments, and patches an Access Violation (`0xC0000005` reading `0x0`) in `ScriptingSystem.dll` when resolving dispatch fallback properties during footprint generation.
 
 ---
 

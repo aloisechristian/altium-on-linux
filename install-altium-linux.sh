@@ -344,6 +344,37 @@ else:
 EOF
     log_succ "Patch hook flood in AdvSim.dll verificata/applicata."
 
+    # 4.1 Patch null pointer dereference in ScriptingSystem.dll
+    python3 - << 'EOF'
+import os
+import glob
+
+matches = glob.glob(os.path.expandvars("$TARGET_PREFIX/drive_c/Program Files/Altium/*/System/ScriptingSystem.dll"))
+if matches:
+    dll_path = matches[0]
+    with open(dll_path, "rb") as f:
+        data = bytearray(f.read())
+
+    sig_orig = bytes.fromhex("48 83 7d 40 00 74 3e 48 8b 45 40 48 8b 40 18 48 8b 08")
+    patch = bytes.fromhex("48 85 c0 74 40 48 8b 40 18 48 85 c0 74 37 48 8b 08 90")
+
+    idx = data.find(sig_orig)
+    if idx != -1:
+        if not os.path.exists(dll_path + ".orig"):
+            with open(dll_path + ".orig", "wb") as bf:
+                bf.write(data)
+        data[idx : idx + len(patch)] = patch
+        with open(dll_path + ".patched", "wb") as f:
+            f.write(data)
+        os.replace(dll_path + ".patched", dll_path)
+        print("Patch ScriptingSystem.dll applicata con successo (offset " + hex(idx) + ")!")
+    else:
+        print("ScriptingSystem.dll già patchato o pattern non trovato.")
+else:
+    print("ScriptingSystem.dll non trovato.")
+EOF
+    log_succ "Patch null pointer dereference in ScriptingSystem.dll verificata/applicata."
+
     # 5. Install optimized Direct2D (d2d1.dll) & win32u.so & Create Launcher Script / DXVK Tuning
     if [[ -f "/home/christiana/custom-wine-dlls/x86_64-windows/d2d1.dll" ]]; then
         log_info "Installazione d2d1.dll ottimizzata (batching GPU + glyph cache 8192 + scaled DWrite analysis) nel prefix..."
@@ -600,6 +631,53 @@ End Function'''
         content = content.replace(old_psp, new_psp)
         with open(vbs_path, 'w', encoding='latin1', newline='') as f:
             f.write(content)
+
+    # Patch missing Set on PCBServer / COM object assignments (fixes Access Violation in ScriptingSystem.dll)
+    with open(vbs_path, 'rb') as f:
+        raw = f.read()
+    lines = raw.split(b'\r\n')
+    new_lines = []
+    modified = False
+    for line in lines:
+        stripped = line.strip()
+        if b'= PCBServer.PCBObjectFactory' in line or b'= pcbserver.PCBObjectFactory' in line:
+            if not line.strip().startswith(b'Set '):
+                indent = len(line) - len(line.lstrip())
+                line = line[:indent] + b'Set ' + line[indent:].replace(b'pcbserver.', b'PCBServer.')
+                modified = True
+        elif stripped == b'PCBLib = PCBServer.GetCurrentPCBLibrary':
+            line = line.replace(b'PCBLib =', b'Set PCBLib =')
+            modified = True
+        elif stripped == b'Component = PCBLib.GetComponent(j)':
+            line = line.replace(b'Component =', b'Set Component =')
+            modified = True
+        elif b'= Client.OpenDocument(' in line and not line.strip().startswith(b'Set '):
+            indent = len(line) - len(line.lstrip())
+            line = line[:indent] + b'Set ' + line[indent:]
+            modified = True
+        elif stripped == b'temp_fp = PCBLib.CreateNewComponent':
+            line = line.replace(b'temp_fp =', b'Set temp_fp =')
+            modified = True
+        elif stripped.startswith(b'Model = STEPmodel.ModelFactory_FromFilename'):
+            line = line.replace(b'Model =', b'Set Model =')
+            modified = True
+        elif stripped == b'PcbLib.CurrentComponent = footprint':
+            indent = len(line) - len(line.lstrip())
+            line = line[:indent] + b'On Error Resume Next: Set PCBLib.CurrentComponent = footprint: PCBLib.CurrentComponent = footprint: On Error GoTo 0'
+            modified = True
+        elif stripped == b'PCBLib.CurrentComponent = temp_fp':
+            indent = len(line) - len(line.lstrip())
+            line = line[:indent] + b'On Error Resume Next: Set PCBLib.CurrentComponent = temp_fp: PCBLib.CurrentComponent = temp_fp: On Error GoTo 0'
+            modified = True
+        elif stripped == b'STEPmodel.Model = Model':
+            indent = len(line) - len(line.lstrip())
+            line = line[:indent] + b'On Error Resume Next: Set STEPmodel.Model = Model: STEPmodel.Model = Model: On Error GoTo 0'
+            modified = True
+        new_lines.append(line)
+    if modified:
+        with open(vbs_path, 'wb') as f:
+            f.write(b'\r\n'.join(new_lines))
+        print("Patch missing Set in AltiumLL.vbs applicata!")
 EOF
         log_succ "Altium Library Loader configurato con successo."
     fi
