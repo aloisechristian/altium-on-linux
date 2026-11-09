@@ -632,6 +632,33 @@ End Function'''
         with open(vbs_path, 'w', encoding='latin1', newline='') as f:
             f.write(content)
 
+    if 'outFile= ecadModelPath & prtName & ".cb"' in content:
+        old_cb_block = '''        outFile= ecadModelPath & prtName & ".cb"
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        Set cbFile = fso.CreateTextFile(outFile,True)
+        cbFile.Write cb
+        cbFile.Close
+        Set fso = Nothing
+        ProcessCB(ecadModelPath & prtName & ".cb")'''
+        new_cb_block = '''        outFile = ecadModelPath & prtName & ".cb"
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        On Error Resume Next
+        If fso.FileExists(outFile) Then fso.DeleteFile outFile, True
+        Set cbFile = fso.CreateTextFile(outFile, True)
+        If Err.Number <> 0 Then
+            Err.Clear
+            outFile = ecadModelPath & prtName & "_" & Int(Timer * 100) & ".cb"
+            Set cbFile = fso.CreateTextFile(outFile, True)
+        End If
+        On Error GoTo 0
+        cbFile.Write cb
+        cbFile.Close
+        Set fso = Nothing
+        ProcessCB(outFile)'''
+        content = content.replace(old_cb_block.replace('\r\n', '\n').replace('\n', '\r\n'), new_cb_block.replace('\r\n', '\n').replace('\n', '\r\n'))
+        with open(vbs_path, 'w', encoding='latin1', newline='') as f:
+            f.write(content)
+
     # Patch missing Set on PCBServer / COM object assignments (fixes Access Violation in ScriptingSystem.dll)
     with open(vbs_path, 'rb') as f:
         raw = f.read()
