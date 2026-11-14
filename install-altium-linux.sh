@@ -46,6 +46,8 @@ EOF
 }
 
 # Default values
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="${ALTIUM_LINUX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/altium-on-linux}"
 TARGET_PREFIX="$HOME/.wine-prefixes/altium"
 INSTALLER_PATH=""
 NON_INTERACTIVE=false
@@ -375,50 +377,24 @@ else:
 EOF
     log_succ "Patch null pointer dereference in ScriptingSystem.dll verificata/applicata."
 
-    # 5. Install optimized Direct2D (d2d1.dll) & win32u.so & Create Launcher Script / DXVK Tuning
-    if [[ -f "/home/christiana/custom-wine-dlls/x86_64-windows/d2d1.dll" ]]; then
-        log_info "Installazione d2d1.dll ottimizzata (batching GPU + glyph cache 8192 + scaled DWrite analysis) nel prefix..."
-        cp -f "/home/christiana/custom-wine-dlls/x86_64-windows/d2d1.dll" "$TARGET_PREFIX/drive_c/windows/system32/d2d1.dll"
-        if [[ -d "/home/christiana/custom-wine-dist/usr/lib/wine/x86_64-windows" ]]; then
-            cp -f "/home/christiana/custom-wine-dlls/x86_64-windows/d2d1.dll" "/home/christiana/custom-wine-dist/usr/lib/wine/x86_64-windows/d2d1.dll" 2>/dev/null || true
-        fi
-        log_succ "d2d1.dll ottimizzata installata in system32."
-    elif [[ -f "/home/christiana/custom-wine-dlls/x86_64-windows/d2d1-native.dll" ]]; then
-        log_info "Installazione d2d1.dll ottimizzata nel prefix..."
-        cp -f "/home/christiana/custom-wine-dlls/x86_64-windows/d2d1-native.dll" "$TARGET_PREFIX/drive_c/windows/system32/d2d1.dll"
-        log_succ "d2d1.dll ottimizzata installata in system32."
+    # 5. Install portable Wine auto-patcher, custom DLLs/SOs & custom-wine-dist
+    log_info "Configurazione runtime Wine ottimizzato e auto-patcher in: $DATA_DIR"
+    mkdir -p "$DATA_DIR/patches"
+    if [[ -d "$SCRIPT_DIR/patches" ]]; then
+        cp -f "$SCRIPT_DIR/patches/"*.patch "$DATA_DIR/patches/" 2>/dev/null || true
     fi
-    if [[ -f "/home/christiana/custom-wine-dlls/x86_64-windows/vbscript.dll" ]]; then
-        log_info "Installazione vbscript.dll ottimizzata (ActiveX IObjectWithSite fix)..."
-        cp -f "/home/christiana/custom-wine-dlls/x86_64-windows/vbscript.dll" "$TARGET_PREFIX/drive_c/windows/system32/vbscript.dll"
-        if [[ -d "/home/christiana/custom-wine-dist/usr/lib/wine/x86_64-windows" ]]; then
-            cp -f "/home/christiana/custom-wine-dlls/x86_64-windows/vbscript.dll" "/home/christiana/custom-wine-dist/usr/lib/wine/x86_64-windows/vbscript.dll" 2>/dev/null || true
-        fi
-        log_succ "vbscript.dll ottimizzata installata in system32."
-    elif [[ -f "$(dirname "$0")/binaries/x86_64-windows/vbscript.dll" ]]; then
-        log_info "Installazione vbscript.dll ottimizzata da binaries/..."
-        cp -f "$(dirname "$0")/binaries/x86_64-windows/vbscript.dll" "$TARGET_PREFIX/drive_c/windows/system32/vbscript.dll"
-        log_succ "vbscript.dll ottimizzata installata in system32."
+    if [[ -f "$SCRIPT_DIR/ensure-wine-patched.sh" ]]; then
+        cp -f "$SCRIPT_DIR/ensure-wine-patched.sh" "$DATA_DIR/ensure-wine-patched.sh"
+        chmod +x "$DATA_DIR/ensure-wine-patched.sh"
     fi
-    if [[ -f "/home/christiana/custom-wine-dlls/x86_64-windows/msado15.dll" ]]; then
-        log_info "Installazione msado15.dll ottimizzata (ADODB.Stream SaveToFile fix)..."
-        cp -f "/home/christiana/custom-wine-dlls/x86_64-windows/msado15.dll" "$TARGET_PREFIX/drive_c/windows/system32/msado15.dll"
-        if [[ -d "/home/christiana/custom-wine-dist/usr/lib/wine/x86_64-windows" ]]; then
-            cp -f "/home/christiana/custom-wine-dlls/x86_64-windows/msado15.dll" "/home/christiana/custom-wine-dist/usr/lib/wine/x86_64-windows/msado15.dll" 2>/dev/null || true
-        fi
-        log_succ "msado15.dll ottimizzata installata in system32."
-    elif [[ -f "$(dirname "$0")/binaries/x86_64-windows/msado15.dll" ]]; then
-        log_info "Installazione msado15.dll ottimizzata da binaries/..."
-        cp -f "$(dirname "$0")/binaries/x86_64-windows/msado15.dll" "$TARGET_PREFIX/drive_c/windows/system32/msado15.dll"
-        log_succ "msado15.dll ottimizzata installata in system32."
-    fi
-    if [[ -f "/home/christiana/custom-wine-dlls/x86_64-unix/win32u.so" ]]; then
-        log_info "Sincronizzazione win32u.so ottimizzata (dirty surface tracking & epoll POLLIN re-arm)..."
-        cp -f "/home/christiana/custom-wine-dlls/x86_64-unix/win32u.so" "$TARGET_PREFIX/win32u.so" 2>/dev/null || true
-        if [[ -d "/home/christiana/custom-wine-dist/usr/lib/wine/x86_64-unix" ]]; then
-            cp -f "/home/christiana/custom-wine-dlls/x86_64-unix/win32u.so" "/home/christiana/custom-wine-dist/usr/lib/wine/x86_64-unix/win32u.so" 2>/dev/null || true
-        fi
-        log_succ "win32u.so sincronizzata."
+    if [[ -x "$DATA_DIR/ensure-wine-patched.sh" ]]; then
+        ALTIUM_LINUX_DATA_DIR="$DATA_DIR" "$DATA_DIR/ensure-wine-patched.sh" \
+            --prefix "$TARGET_PREFIX" \
+            --patches-dir "$DATA_DIR/patches" \
+            --binaries-dir "$SCRIPT_DIR/binaries"
+        log_succ "Moduli Wine custom e runtime sincronizzati con la versione di sistema."
+    else
+        log_warn "ensure-wine-patched.sh non trovato in $SCRIPT_DIR; assicurati che l'intera repository sia stata clonata."
     fi
 
     # 5.2 Set BufferedPainting=1 across all Altium Schematic preference sections in user.reg
@@ -470,27 +446,53 @@ EOF
 #!/usr/bin/env bash
 export WINEPREFIX="$TARGET_PREFIX"
 export WINEARCH="win64"
-export WINEDEBUG="-all"
-export WINEDLLPATH="/home/christiana/custom-wine-dlls:/home/christiana/wine-custom-libs:/usr/lib/wine/x86_64-unix:/usr/lib/wine/x86_64-windows"
+export WINEDEBUG="\${WINEDEBUG:--all}"
 export WINEDLLOVERRIDES="d2d1=n,b;gdiplus=n,b;vbscript=n,b;msado15=n,b"
 
 # Disabilita VSync a livello driver e DXVK per ridisegno immediato e reattivo
 export __GL_SYNC_TO_VBLANK=0
 export vblank_mode=0
 export DXVK_CONFIG_FILE="$DXVK_CONF"
-export DXVK_HUD="${DXVK_HUD:-0}"
+export DXVK_HUD="\${DXVK_HUD:-0}"
 
-# Forza NVIDIA GPU in modalità massime prestazioni (P0) per eliminare stutter e latenza clock
-DISPLAY="${DISPLAY:-:1}" nvidia-settings -a "[gpu:0]/GPUPowerMizerMode=1" >/dev/null 2>&1 || true
+# Forza NVIDIA GPU in modalità massime prestazioni (P0) se presente
+if command -v nvidia-settings >/dev/null 2>&1; then
+    DISPLAY="\${DISPLAY:-:0}" nvidia-settings -a "[gpu:0]/GPUPowerMizerMode=1" >/dev/null 2>&1 || true
+fi
 
-CUSTOM_WINESERVER="/home/christiana/wine-d2d1-build/build64/server/wineserver"
+# Verifica che i moduli Wine custom corrispondano al pacchetto Wine di sistema
+DATA_DIR="\${ALTIUM_LINUX_DATA_DIR:-$DATA_DIR}"
+ENSURE_PATCHED="\$DATA_DIR/ensure-wine-patched.sh"
+if [[ -x "\$ENSURE_PATCHED" ]]; then
+    ALTIUM_LINUX_DATA_DIR="\$DATA_DIR" "\$ENSURE_PATCHED" --prefix "\$WINEPREFIX" || exit 1
+fi
+
+DIST_WINE_BIN="\$DATA_DIR/custom-wine-dist/current-wine"
+if [[ -x "\$DIST_WINE_BIN" ]]; then
+    WINE_LIB_ROOT="\$(dirname "\$(dirname "\$(readlink -f "\$DIST_WINE_BIN")")")"
+    export WINEDLLPATH="\$DATA_DIR/custom-dlls:\$WINE_LIB_ROOT/x86_64-unix:\$WINE_LIB_ROOT/x86_64-windows"
+    WINE_BIN="\$DIST_WINE_BIN"
+else
+    export WINEDLLPATH="\$DATA_DIR/custom-dlls"
+    WINE_BIN="wine"
+fi
+
+CUSTOM_WINESERVER="\$DATA_DIR/custom-dlls/x86_64-unix/wineserver"
 if [[ -x "\$CUSTOM_WINESERVER" ]]; then
     export WINESERVER="\$CUSTOM_WINESERVER"
-    if ! pgrep -f "\$CUSTOM_WINESERVER" >/dev/null 2>&1; then
-        killall -9 wineserver 2>/dev/null || true
-        sleep 0.2
-        "\$CUSTOM_WINESERVER" -p
-        sleep 0.2
+    NEED_START=1
+    for ws_pid in \$(pidof wineserver 2>/dev/null || true); do
+        EXE_PATH=\$(readlink -f "/proc/\$ws_pid/exe" 2>/dev/null || true)
+        if [[ "\$EXE_PATH" == "\$CUSTOM_WINESERVER" ]]; then
+            NEED_START=0
+        else
+            kill -9 "\$ws_pid" 2>/dev/null || true
+            sleep 0.2
+        fi
+    done
+    if [[ "\$NEED_START" -eq 1 ]]; then
+        WINEPREFIX="\$WINEPREFIX" "\$CUSTOM_WINESERVER" -p
+        sleep 0.3
     fi
 fi
 
@@ -499,11 +501,6 @@ ALTIUM_EXE="$X2_EXE"
 if [[ ! -f "\$ALTIUM_EXE" ]]; then
     echo "Eseguibile non trovato: \$ALTIUM_EXE"
     exit 1
-fi
-
-WINE_BIN="/home/christiana/custom-wine-dist/usr/lib/wine/x86_64-unix/wine"
-if [[ ! -x "\$WINE_BIN" ]]; then
-    WINE_BIN="wine"
 fi
 
 "\$WINE_BIN" "\$ALTIUM_EXE" --disable-gpu-sandbox --renderer-process-limit=2 --js-flags="--max-old-space-size=256" "\$@"
@@ -732,8 +729,8 @@ configure_prefix_environment() {
 
     log_info "Installazione e sincronizzazione font di sistema (Segoe UI, Tahoma)..."
     mkdir -p "$TARGET_PREFIX/drive_c/windows/Fonts" "$HOME/.local/share/fonts/segoe-ui" "$HOME/.local/share/fonts/tahoma"
-    if [[ -d "/home/christiana/.local/share/fonts/segoe-ui" ]]; then
-        cp -f /home/christiana/.local/share/fonts/segoe-ui/*.ttf "$TARGET_PREFIX/drive_c/windows/Fonts/" 2>/dev/null || true
+    if [[ -d "$HOME/.local/share/fonts/segoe-ui" ]]; then
+        cp -f "$HOME/.local/share/fonts/segoe-ui/"*.ttf "$TARGET_PREFIX/drive_c/windows/Fonts/" 2>/dev/null || true
     fi
     if [[ -f "$TARGET_PREFIX/drive_c/windows/Fonts/tahoma.ttf" ]]; then
         cp -f "$TARGET_PREFIX/drive_c/windows/Fonts/tahoma"*.ttf "$HOME/.local/share/fonts/tahoma/" 2>/dev/null || true
@@ -866,6 +863,14 @@ EOF
 
 # If patch only requested, apply and exit
 if [[ "$PATCH_ONLY" = true ]]; then
+    if [[ -z "$EXISTING_ALTIUM" ]]; then
+        FOUND_EXE="$(find "$TARGET_PREFIX/drive_c/Program Files" -maxdepth 4 -iname "X2.EXE" 2>/dev/null | head -n 1 || true)"
+        [[ -n "$FOUND_EXE" ]] && EXISTING_ALTIUM="$(dirname "$FOUND_EXE")"
+    fi
+    if [[ -z "$EXISTING_ALTIUM" ]]; then
+        log_err "Nessuna installazione di Altium Designer trovata in $TARGET_PREFIX."
+        exit 1
+    fi
     configure_prefix_environment
     apply_patches_and_finish "$EXISTING_ALTIUM"
     exit 0

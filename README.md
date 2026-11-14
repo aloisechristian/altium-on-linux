@@ -3,9 +3,10 @@
 Run **Altium Designer 26 (and 24/25)** on Linux under Wine with **solid 60–300+ FPS fluid hardware-accelerated Schematic (Direct2D via DXVK)** and **fluid PCB 2D/3D (Vulkan)**.
 
 This repository provides:
-1. **`install-altium-linux.sh`**: A one-click automated installer and patcher script.
-2. **Pre-built optimized binaries**: Custom patched `d2d1.dll`, `win32u.so`, and `wineserver`.
-3. **Source patches**: Clean upstream-ready patches for Wine 11.x fixing Direct2D/DirectWrite world-to-pixel scaling, epoll socket stalling, and mouse input coalescing.
+1. **`install-altium-linux.sh`**: A one-click automated installer and patcher script (portable across distros, no hardcoded user paths).
+2. **`ensure-wine-patched.sh`**: Runs automatically before every launch to verify the custom Wine modules match your installed system Wine version; if you update Wine via your package manager (`pacman`, `apt`, `dnf`, etc.), it automatically fetches the matching upstream Wine tag, applies [`patches/`](patches/), recompiles the 5 modified modules, and updates your prefix.
+3. **Pre-built optimized binaries (`binaries/`, currently `wine-11.22`)**: Custom patched `d2d1.dll`, `win32u.so`, `wineserver`, `vbscript.dll`, and `msado15.dll` for instant setup when your system Wine matches [`binaries/VERSION`](binaries/VERSION).
+4. **Source patches (`patches/`)**: Clean upstream-ready patches for Wine 11.x fixing Direct2D/DirectWrite world-to-pixel scaling, epoll socket stalling, mouse input coalescing, `vbscript` ActiveX site creation, and `msado15` stream file I/O.
 
 ---
 
@@ -26,18 +27,18 @@ This repository provides:
 ## 🚀 Quick Start (Automated Installer)
 
 ### Prerequisites
-Make sure your system has the standard Wine dependencies installed:
+Make sure your system has standard Wine + build dependencies installed (build tools are only used automatically if your system Wine differs from [`binaries/VERSION`](binaries/VERSION) or after a future system Wine upgrade):
 - On **Arch Linux**:
   ```bash
-  sudo pacman -S wine winetricks vulkan-icd-loader lib32-vulkan-icd-loader python
+  sudo pacman -S --needed wine winetricks vulkan-icd-loader lib32-vulkan-icd-loader python git make flex bison clang lld freetype2 pkgconf
   ```
 - On **Ubuntu / Debian**:
   ```bash
-  sudo apt install wine winetricks python3
+  sudo apt install wine winetricks python3 git make flex bison gcc-mingw-w64-x86-64 libfreetype-dev pkg-config
   ```
 - On **Fedora**:
   ```bash
-  sudo dnf install wine winetricks python3
+  sudo dnf install wine winetricks python3 git make flex bison mingw64-gcc freetype-devel pkgconf-pkg-config
   ```
 
 ### Automated Setup
@@ -109,8 +110,10 @@ Make sure your system has the standard Wine dependencies installed:
 
 In [`patches/`](patches/):
 - [`01-d2d1-schematic-glyph-cache-and-scale-fix.patch`](patches/01-d2d1-schematic-glyph-cache-and-scale-fix.patch): Direct2D world-to-pixel normalization, 8,192-slot glyph cache, and fast AABB rejection.
-- [`02-win32u-wineserver-poll-events-and-input.patch`](patches/02-win32u-wineserver-poll-events-and-input.patch): Inconditional epoll `POLLIN` re-arm, mouse input coalescing, and `WH_MOUSE_LL` sync bypass.
-- [`00-full-wine-11.20-altium-fluid.patch`](patches/00-full-wine-11.20-altium-fluid.patch): Unified patch against Wine 11.20.
+- [`02-win32u-wineserver-poll-events-and-input.patch`](patches/02-win32u-wineserver-poll-events-and-input.patch): Unconditional epoll `POLLIN` re-arm, mouse input coalescing, and `WH_MOUSE_LL` sync bypass.
+- [`03-vbscript-axsite-iserviceprovider.patch`](patches/03-vbscript-axsite-iserviceprovider.patch): Allows `vbscript` ActiveX site creation when the host does not implement `IServiceProvider`.
+- [`04-msado15-stream-savetofile.patch`](patches/04-msado15-stream-savetofile.patch): Implements `ADODB.Stream` `SaveToFile` and `LoadFromFile` in `msado15.dll`.
+- [`00-full-wine-11.20-altium-fluid.patch`](patches/00-full-wine-11.20-altium-fluid.patch): Unified core fluid/D2D/win32u/wineserver patch (applies cleanly on Wine 11.20–11.22+ alongside `03` and `04`).
 
 ---
 

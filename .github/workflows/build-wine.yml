@@ -28,29 +28,34 @@ jobs:
 
       - name: Clone Wine source
         run: |
-          git clone --depth 1 --branch wine-11.20 https://gitlab.winehq.org/wine/wine.git wine-src || \
+          WINE_TAG="$(cat binaries/VERSION 2>/dev/null || echo wine-11.22)"
+          git clone --depth 1 --branch "$WINE_TAG" https://gitlab.winehq.org/wine/wine.git wine-src || \
           git clone --depth 1 --branch master https://gitlab.winehq.org/wine/wine.git wine-src
 
       - name: Apply patches
         run: |
           cd wine-src
-          git apply ../patches/00-full-wine-11.20-altium-fluid.patch || {
+          git apply --3way ../patches/00-full-wine-11.20-altium-fluid.patch || {
             echo "Applying individual patches..."
-            git apply ../patches/01-d2d1-schematic-glyph-cache-and-scale-fix.patch
-            git apply ../patches/02-win32u-wineserver-poll-events-and-input.patch
+            git apply --3way ../patches/01-d2d1-schematic-glyph-cache-and-scale-fix.patch
+            git apply --3way ../patches/02-win32u-wineserver-poll-events-and-input.patch
           }
           if [ -f ../patches/03-vbscript-axsite-iserviceprovider.patch ]; then
-            git apply ../patches/03-vbscript-axsite-iserviceprovider.patch
+            git apply --3way ../patches/03-vbscript-axsite-iserviceprovider.patch
           fi
           if [ -f ../patches/04-msado15-stream-savetofile.patch ]; then
-            git apply ../patches/04-msado15-stream-savetofile.patch
+            git apply --3way ../patches/04-msado15-stream-savetofile.patch
           fi
 
       - name: Configure Wine
         run: |
           mkdir build64
           cd build64
-          ../wine-src/configure --enable-win64 --without-x --without-pulse --without-alsa
+          CFG_ARCH_FLAG="--enable-win64"
+          if grep -q -- '--enable-archs' ../wine-src/configure; then
+            CFG_ARCH_FLAG="--enable-archs=x86_64"
+          fi
+          ../wine-src/configure "$CFG_ARCH_FLAG" --disable-tests --without-x --without-pulse --without-alsa
 
       - name: Build d2d1.dll, win32u.so, wineserver and vbscript.dll
         run: |
@@ -78,6 +83,7 @@ jobs:
           cp -f build64/dlls/msado15/x86_64-windows/msado15.dll dist/binaries/x86_64-windows/
           cp -f build64/dlls/win32u/win32u.so dist/binaries/x86_64-unix/
           cp -f build64/server/wineserver dist/binaries/x86_64-unix/
+          [ -f binaries/VERSION ] && cp -f binaries/VERSION dist/binaries/VERSION
           tar -czvf altium-wine-binaries-linux-x86_64.tar.gz -C dist .
 
       - name: Upload binaries artifact
