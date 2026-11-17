@@ -1,6 +1,6 @@
 # Altium Designer on Linux (Native Wine Performance Guide & Auto-Installer)
 
-Run **Altium Designer 26 (and 24/25)** on Linux under Wine with **solid 60–300+ FPS fluid hardware-accelerated Schematic (Direct2D via DXVK)** and **fluid PCB 2D/3D (Vulkan)**.
+Run **Altium Designer (AD20, AD22, and AD24–AD26)** on Linux under Wine with **solid 60–300+ FPS fluid hardware-accelerated Schematic (Direct2D via DXVK)** and **fluid PCB 2D/3D (Vulkan)**.
 
 This repository provides:
 1. **`install-altium-linux.sh`**: A one-click automated installer and patcher script (portable across distros, no hardcoded user paths).
@@ -50,9 +50,14 @@ Make sure your system has standard Wine + build dependencies installed (build to
    ```
 
 2. **Run the installer**:
-   - **For a fresh installation** (with installer `.exe`):
+   - **For a fresh installation** (with installer `.exe`, e.g. AD26):
      ```bash
      ./install-altium-linux.sh -i ~/Downloads/AltiumDesignerSetup_26_11_1.exe
+     ```
+   - **To install older versions side-by-side** (separate Wine prefix per version, e.g. AD20 or AD22):
+     ```bash
+     ./install-altium-linux.sh -p ~/.wine-prefixes/altium22 -i ~/Downloads/AltiumDesignerSetup_22_10_1.exe
+     ./install-altium-linux.sh -p ~/.wine-prefixes/altium20 -i ~/Downloads/AltiumDesignerSetup_20_0_9.exe
      ```
    - **To patch an existing Altium installation** (without reinstalling):
      ```bash
@@ -60,7 +65,7 @@ Make sure your system has standard Wine + build dependencies installed (build to
      ```
 
 3. **Launch Altium Designer**:
-   Launch it from your application menu or run:
+   Launch it from your application menu (`Altium Designer (AD20)`, `Altium Designer (AD22)`, `Altium Designer (AD26)`, etc.) or run:
    ```bash
    ~/.wine-prefixes/altium/start-altium.sh
    ```
@@ -70,21 +75,24 @@ Make sure your system has standard Wine + build dependencies installed (build to
 ## 🛠️ What the Installer Fixes Automatically
 
 1. **Google OAuth / Browser Sign-in (PKCE Native Bridge)**:
-   Altium's online installer and Altium 365 login fail inside Wine because the embedded WebView cannot complete modern OAuth flows. The installer runs a native Python listener that delegates to your Linux browser (Firefox/Chrome) and transparently acquires the session token.
-2. **Schematic Direct2D World-to-Pixel Font Scaling & Glyph Cache**:
-   Fixes the root cause of the 6.8 FPS schematic lag in Wine Direct2D (`d2d1.dll`).
-3. **`InheritWindowMonitor` Menu Crash (`C06D007F` / Abstract Error)**:
-   Delphi VCL crashes when querying virtual monitor configurations under Wine. Patched in `X2.EXE`.
-4. **Black Context Menus (DevExpress Layered Windows)**:
+   Altium's online installer (`-SessionId:<tok> -Install` on AD24+ and `-SessionID:<tok>` on AD20/AD22) and modern Altium 365 login fail inside Wine because the embedded WebView cannot complete modern OAuth flows. The installer runs a native Python listener that delegates to your Linux browser (Firefox/Chrome) and transparently acquires the session token.
+   *(Note for AD20/AD22: if the in-app **Sign in** dialog only accepts email/password on your account, set an Altium password via **"Forgotten password ?"** on `https://myaccount.altium.com/` or activate via a `.alf` file / Private License Server.)*
+2. **Legacy `.NET Framework 4.x` Support (AD20 / AD22) & CefSharp Rendering**:
+   Automatically detects `.NET Framework 4.x` Altium builds (absence of `hostfxr.dll`/`coreclr.dll`), installs native Microsoft `.NET Framework 4.8` (`dotnet48`) cleanly (avoiding `IDispatch` client crashes in Wine Mono and redundant `wineboot -u` `mscoree.dll` dialogs), configures `LC_ALL=en_US.UTF-8` + `--disable-gpu --disable-gpu-compositing` for CefSharp panels, and isolates each prefix's `wineserver` and `.desktop` launcher.
+3. **Schematic Direct2D World-to-Pixel Font Scaling & Glyph Cache**:
+   Fixes the root cause of the 6.8 FPS schematic lag in Wine Direct2D (`d2d1.dll`) and dynamically locates `AdvSch.dll` (`FUseDC`) offsets across AD20, AD22, and AD26.
+4. **`InheritWindowMonitor` & `TWinControl.CreateWnd` Focus/Menu Fixes**:
+   Dynamically patches `X2.EXE` via PE IAT/DIAT resolution (`InheritWindowMonitor` when imported, `TWinControl.CreateWnd` focus thunks, and `TViewComponent` `_AddRef`-before-`SetServerView` COM lifetime fix on `.NET 4.x`).
+5. **Black Context Menus (DevExpress Layered Windows)**:
    Disables problematic fade/slide animations via registry.
-5. **WPF Invisible Text / Black Boxes**:
+6. **WPF Invisible Text / Black Boxes**:
    Configures `Avalon.Graphics` registry flags.
-6. **Telemetry & Atom Table IPC Flood**:
-   Patches `X2.EXE` loop that was executing 32,768 synchronous socket calls to `wineserver` every 5 seconds.
-7. **Simulation Hover Flood**:
-   Patches `AdvSim.dll` from triggering thousands of recursive `WindowFromPoint` and hook queries on mouse move.
-8. **SamacSys Altium Library Loader (`AltiumLL.vbs`)**:
-   Fixes `Permission Denied`, VBScript Base64 character conversion bugs in Wine, missing `Set` keywords on `PCBServer`/COM object assignments, and patches an Access Violation (`0xC0000005` reading `0x0`) in `ScriptingSystem.dll` when resolving dispatch fallback properties during footprint generation.
+7. **Telemetry & Atom Table IPC Flood**:
+   Dynamically locates and patches the `X2.EXE` `CountAtoms` loop that executed 32,768 synchronous calls to `wineserver` every 5 seconds.
+8. **Simulation Hover Flood**:
+   Patches `AdvSim.dll` (on versions where present) to prevent thousands of recursive `WindowFromPoint` and hook queries on mouse move.
+9. **SamacSys Altium Library Loader (`AltiumLL.vbs`)**:
+   Fixes `Permission Denied`, VBScript Base64 character conversion bugs in Wine, missing `Set` keywords on `PCBServer`/COM object assignments, and patches an Access Violation (`0xC0000005` reading `0x0`) in `ScriptingSystem.dll` across supported versions.
 
 ---
 

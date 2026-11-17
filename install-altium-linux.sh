@@ -142,12 +142,32 @@ apply_patches_and_finish() {
     local X2_EXE="$ALTIUM_DIR/X2.EXE"
     [[ -f "$X2_EXE" ]] || X2_EXE="$ALTIUM_DIR/X2.exe"
     local AUTH_DLL="$ALTIUM_DIR/System/Altium.Identity.Authentication.dll"
+    local IS_DOTNET_FX=false
+    if [[ ! -f "$ALTIUM_DIR/hostfxr.dll" && ! -f "$ALTIUM_DIR/coreclr.dll" ]]; then
+        IS_DOTNET_FX=true
+    fi
 
     echo ""
     log_info "Applicazione delle correzioni ad Altium Designer..."
 
-    # 1. Patch Altium.Identity.Authentication.dll
-    log_info "Applicazione Patch OAuth in Altium.Identity.Authentication.dll..."
+    # 0. Install Microsoft .NET Framework 4.8 for legacy .NET Framework versions (e.g. AD20/AD22)
+    #    Wine Mono does not support ComInterfaceType.InterfaceIsIDispatch used by Altium.SDK.Interfaces.dll
+    if [[ "$IS_DOTNET_FX" = true ]]; then
+        if [[ ! -f "$TARGET_PREFIX/dosdevices/c:/windows/dotnet48.installed.workaround" ]]; then
+            log_info "Rilevato Altium basato su .NET Framework 4.x: installazione di Microsoft .NET Framework 4.8 (dotnet48)..."
+            wineserver -k 2>/dev/null || true
+            LC_ALL=en_US.UTF-8 winetricks -q --force dotnet48 win10 || {
+                log_warn "Winetricks dotnet48 completato con avvisi non critici. Verifica in corso..."
+            }
+            wineserver -w 2>/dev/null || true
+            log_succ "Microsoft .NET Framework 4.8 configurato."
+        else
+            log_succ "Microsoft .NET Framework 4.8 già presente nel prefix."
+        fi
+    fi
+
+    # 1. Patch Altium.Identity.Authentication.dll (presente nelle versioni con OAuth integrato, es. AD26)
+    log_info "Verifica Patch OAuth in Altium.Identity.Authentication.dll..."
     if [[ -f "$AUTH_DLL" ]]; then
         python3 - << EOF
 import os
@@ -173,140 +193,251 @@ else:
 EOF
         log_succ "Patch OAuth verificata/applicata."
     else
-        log_warn "File $AUTH_DLL non trovato, patch saltata."
+        log_info "File Altium.Identity.Authentication.dll non presente in questa versione, patch OAuth saltata."
     fi
 
-    # 2. Patch InheritWindowMonitor in X2.EXE
-    log_info "Applicazione Patch crash menu C06D007F (InheritWindowMonitor in X2.EXE)..."
+    # 2, 3, 4 & 4.2: Multi-version PE patches in X2.EXE
+    #   - InheritWindowMonitor delay-import thunk (solo se presente nel PE Delay Import Directory, es. AD26)
+    #   - TWinControl.CreateWnd ("Control has no parent window"), con risoluzione dinamica IAT stubs
+    #   - CountAtoms telemetry loop
+    #   - TViewComponent _AddRef prima di SetServerView (versioni legacy tipo AD20)
+    log_info "Applicazione delle patch binarie su $(basename "$X2_EXE")..."
     python3 - << EOF
-import struct, os
+import os, re, shutil, struct
 
 path = "$X2_EXE"
+is_dotnet_fx = ("$IS_DOTNET_FX" == "true")
 with open(path, "rb") as f:
     data = bytearray(f.read())
+orig_snapshot = bytes(data)
+modified = False
 
-patch = bytes([0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90])
-pos = 0xab3360
+def parse_pe(buf):
+    e_lfanew = struct.unpack_from("<I", buf, 0x3c)[0]
+    nsec = struct.unpack_from("<H", buf, e_lfanew + 6)[0]
+    ohsz = struct.unpack_from("<H", buf, e_lfanew + 20)[0]
+    opth = e_lfanew + 24
+    base = struct.unpack_from("<Q", buf, opth + 24)[0]
+    dd = opth + 112
+    secs = []
+    for i in range(nsec):
+        sec_off = opth + ohsz + i * 40
+        name, vsz, sva, rsz, rp = struct.unpack_from("<8sIIII", buf, sec_off)
+        secs.append((name, vsz, sva, rsz, rp, sec_off))
+    return base, dd, secs
 
-if pos < len(data) and data[pos] == 0x52 and data[pos+1] == 0x48 and data[pos+2] == 0x8d and data[pos+3] == 0x15:
-    if not os.path.exists(path + ".bak"):
-        with open(path + ".bak", "wb") as bf:
-            bf.write(data)
-    data[pos:pos+len(patch)] = patch
-    with open(path, "wb") as f:
-        f.write(data)
-    print("Patch InheritWindowMonitor applicata con successo all'offset noto 0xab3360!")
-else:
-    found = False
-    idx = data.find(bytes([0x52, 0x48, 0x8d, 0x15]))
-    while idx != -1:
-        if data[idx+8:idx+11] == bytes([0xe9, 0xc3, 0xff]) or data[idx+13:idx+16] == bytes([0xcc, 0xcc, 0xcc]):
-            if not os.path.exists(path + ".bak"):
-                with open(path + ".bak", "wb") as bf:
-                    bf.write(data)
-            data[idx:idx+len(patch)] = patch
-            with open(path, "wb") as f:
-                f.write(data)
-            print(f"Patch InheritWindowMonitor applicata all'offset {hex(idx)}!")
-            found = True
+base, dd, secs = parse_pe(data)
+_, tvsz, tsva, trsz, trp, tsec_off = secs[0]
+tva = base + tsva
+
+def rva2off(rva):
+    for _, vsz, sva, rsz, rp, _ in secs:
+        if sva <= rva < sva + max(vsz, rsz):
+            return rp + (rva - sva)
+    return None
+
+def off2va(off):
+    for _, vsz, sva, rsz, rp, _ in secs:
+        if rp <= off < rp + rsz:
+            return base + sva + (off - rp)
+    return None
+
+# --- 2. InheritWindowMonitor (via PE Delay Import Directory) ---
+dimp_rva, _ = struct.unpack_from("<II", data, dd + 13 * 8)
+iwm_diat_va = None
+if dimp_rva:
+    off = rva2off(dimp_rva)
+    while off is not None:
+        _, dll_rva, _, diat_rva, dint_rva = struct.unpack_from("<IIIII", data, off)
+        if not dll_rva:
             break
-        idx = data.find(bytes([0x52, 0x48, 0x8d, 0x15]), idx+1)
-    if not found:
-        print("Thunk InheritWindowMonitor già patchato o non trovato.")
-EOF
-    log_succ "Patch InheritWindowMonitor verificata/applicata."
+        if dint_rva:
+            io = rva2off(dint_rva)
+            slot = 0
+            while io is not None:
+                ent, = struct.unpack_from("<Q", data, io + slot * 8)
+                if not ent:
+                    break
+                if not (ent & (1 << 63)):
+                    ho = rva2off(ent & 0x7fffffff) + 2
+                    fn = data[ho:data.find(b"\x00", ho)].decode("ascii", "replace")
+                    if fn == "InheritWindowMonitor":
+                        iwm_diat_va = base + diat_rva + slot * 8
+                        break
+                slot += 1
+        if iwm_diat_va is not None:
+            break
+        off += 32
 
-    # 3. Patch "Control has no parent window" (EInvalidOperation in TWinControl.CreateWnd) in X2.EXE
-    log_info "Applicazione Patch apertura schematici (Control has no parent window in X2.EXE)..."
-    python3 - << EOF
-import os, struct, shutil
+if iwm_diat_va is not None:
+    iwm_patch = bytes([0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3] + [0x90] * 10)
+    iwm_patched = False
+    for j in range(trsz - 16):
+        if data[trp + j : trp + j + 4] == b"\x52\x48\x8d\x15":
+            rel, = struct.unpack_from("<i", data, trp + j + 4)
+            if tva + j + 8 + rel == iwm_diat_va:
+                data[trp + j : trp + j + len(iwm_patch)] = iwm_patch
+                modified = True
+                iwm_patched = True
+                print(f"Patch InheritWindowMonitor applicata all'offset {hex(trp + j)}!")
+                break
+    if not iwm_patched:
+        print("Thunk InheritWindowMonitor già patchato.")
+else:
+    print("InheritWindowMonitor non presente nei delay-import, patch saltata.")
 
-path = "$X2_EXE"
-with open(path, "rb") as f:
-    data = bytearray(f.read())
+# --- 3. TWinControl.CreateWnd ("Control has no parent window") ---
+sig_cw = bytes.fromhex("48 89 85 c8 00 00 00 eb 46 48 8d 4d 58")
+idx_cw = data.find(sig_cw)
+if idx_cw != -1:
+    imp_rva, _ = struct.unpack_from("<II", data, dd + 1 * 8)
+    iat_targets = {}
+    if imp_rva:
+        off = rva2off(imp_rva)
+        while off is not None:
+            ilt_rva, _, _, name_rva, iat_rva = struct.unpack_from("<IIIII", data, off)
+            if not name_rva:
+                break
+            no = rva2off(name_rva)
+            dll = data[no:data.find(b"\x00", no)].decode("ascii", "replace").lower()
+            if dll == "user32.dll":
+                io = rva2off(ilt_rva or iat_rva)
+                slot = 0
+                while io is not None:
+                    ent, = struct.unpack_from("<Q", data, io + slot * 8)
+                    if not ent:
+                        break
+                    if not (ent & (1 << 63)):
+                        ho = rva2off(ent & 0x7fffffff) + 2
+                        fn = data[ho:data.find(b"\x00", ho)].decode("ascii", "replace")
+                        if fn in ("GetActiveWindow", "GetForegroundWindow"):
+                            iat_targets[fn] = base + iat_rva + slot * 8
+                    slot += 1
+            off += 20
 
-sig = bytes.fromhex('48 89 85 c8 00 00 00 eb 46 48 8d 4d 58')
-idx = data.find(sig)
-if idx != -1:
-    pos = idx + 9
-    patch_code = bytes.fromhex('48 83 ec 20 e8 11 83 c8 ff 48 85 c0 75 05 e8 67 84 c8 ff 48 83 c4 20 48 89 85 c8 00 00 00 eb 26') + bytes([0x90] * 38)
-    if not os.path.exists(path + ".bak"):
-        with open(path + ".bak", "wb") as bf:
-            bf.write(data)
-    data[pos:pos+70] = patch_code
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "wb") as f:
-        f.write(data)
-    shutil.copymode(path, tmp_path)
-    os.replace(tmp_path, path)
-    print("Patch TWinControl.CreateWnd applicata con successo!")
+    stubs = {}
+    for fn, target_iat in iat_targets.items():
+        for j in range(trsz - 6):
+            if data[trp + j] == 0xff and data[trp + j + 1] == 0x25:
+                rel, = struct.unpack_from("<i", data, trp + j + 2)
+                if tva + j + 6 + rel == target_iat:
+                    stubs[fn] = tva + j
+                    break
+
+    if "GetActiveWindow" in stubs and "GetForegroundWindow" in stubs:
+        pos = idx_cw + 9
+        pos_va = off2va(pos)
+        rel_active = struct.pack("<i", stubs["GetActiveWindow"] - (pos_va + 9))
+        rel_fg = struct.pack("<i", stubs["GetForegroundWindow"] - (pos_va + 19))
+        patch_cw = (
+            b"\x48\x83\xec\x20"
+            b"\xe8" + rel_active +
+            b"\x48\x85\xc0\x75\x05"
+            b"\xe8" + rel_fg +
+            b"\x48\x83\xc4\x20\x48\x89\x85\xc8\x00\x00\x00\xeb\x26"
+            + b"\x90" * 38
+        )
+        data[pos : pos + len(patch_cw)] = patch_cw
+        modified = True
+        print(f"Patch TWinControl.CreateWnd applicata all'offset {hex(pos)}!")
+    else:
+        print("ATTENZIONE: stub user32 GetActiveWindow/GetForegroundWindow non trovati.")
 else:
     print("Pattern TWinControl.CreateWnd già patchato o non trovato.")
-EOF
-    log_succ "Patch apertura schematici verificata/applicata."
 
-    # 4. Patch Atom Leak / Telemetry Brute-Force Loop in X2.EXE
-    log_info "Applicazione Patch ciclo monitor atom/clipboard (CountAtoms in X2.EXE)..."
-    python3 - << EOF
-import os, shutil
+# --- 4. CountAtoms Telemetry Loop ---
+sig_ca = bytes.fromhex("55 48 83 ec 40 48 8b ec 48 89 4d 50 c7 45 34 00 00 00 00 c7 45 2c 00 00 00 00 c7 45 30 00 c0 00 00")
+idx_ca = data.find(sig_ca)
+if idx_ca != -1:
+    patch_ca = bytes([
+        0xc7, 0x41, 0x18, 0x32, 0x00, 0x00, 0x00,
+        0xc7, 0x41, 0x1c, 0x32, 0x00, 0x00, 0x00,
+        0xc3,
+    ]) + b"\x90" * (150 - 15)
+    data[idx_ca : idx_ca + len(patch_ca)] = patch_ca
+    modified = True
+    print(f"Patch CountAtoms applicata all'offset {hex(idx_ca)}!")
+else:
+    print("Pattern CountAtoms già patchato o non trovato.")
 
-path = "$X2_EXE"
-with open(path, "rb") as f:
-    data = bytearray(f.read())
+# --- 4.2 TViewComponent _AddRef prima di SetServerView (AD20 .NET Framework) ---
+m_s1 = list(re.finditer(rb"\x48\x89\xc3\x48\x89\xd9\x48\x8b\x55\x38\x48\x8b\x33\xff\x96\x28\x02\x00\x00.{100,400}?\x48\x89\xd9\x48\x8b\x03\xff\x90\x38\x02\x00\x00", data, re.S))
+m_s2 = list(re.finditer(rb"\x48\x8b\x55\x78\x48\x8b\x45\x28\x48\x8b\x18\xff\x93\x28\x02\x00\x00.{8,24}?\x48\x8b\x45\x28\x48\x89\xc1\x48\x8b\x00\xff\x90\x38\x02\x00\x00", data, re.S))
+if is_dotnet_fx and (m_s1 or m_s2):
+    cave1 = bytes.fromhex("48 89 c3 48 83 ec 28 48 89 d9 48 8b 03 ff 90 38 02 00 00 48 89 d9 48 8b 55 38 48 8b 33 ff 96 28 02 00 00 48 83 c4 28 c3")
+    cave2 = bytes.fromhex("48 83 ec 28 48 8b 4d 28 48 8b 01 ff 90 38 02 00 00 48 8b 4d 28 48 8b 55 78 48 8b 01 48 89 c3 ff 93 28 02 00 00 48 83 c4 28 c3")
+    # Allocate aligned caves inside .text tail zero padding
+    cave_off1 = trp + ((tvsz + 15) & ~15)
+    cave_off2 = cave_off1 + ((len(cave1) + 15) & ~15)
+    needed_vsz = (cave_off2 - trp) + len(cave2)
+    next_sva = secs[1][2] if len(secs) > 1 else tsva + trsz
+    if cave_off2 + len(cave2) <= trp + trsz and tsva + needed_vsz <= next_sva and all(b == 0 for b in data[cave_off1 : cave_off2 + len(cave2)]):
+        data[cave_off1 : cave_off1 + len(cave1)] = cave1
+        data[cave_off2 : cave_off2 + len(cave2)] = cave2
+        if needed_vsz > tvsz:
+            struct.pack_into("<I", data, tsec_off + 8, needed_vsz)
+        cave1_va = off2va(cave_off1)
+        cave2_va = off2va(cave_off2)
+        for m in m_s1:
+            s_off = m.start()
+            l_off = m.end() - 12
+            rel = struct.pack("<i", cave1_va - (off2va(s_off) + 5))
+            data[s_off : s_off + 19] = b"\xe8" + rel + b"\x90" * 14
+            data[l_off : l_off + 12] = b"\x90" * 12
+        for m in m_s2:
+            s_off = m.start()
+            l_off = m.end() - 16
+            rel = struct.pack("<i", cave2_va - (off2va(s_off) + 5))
+            data[s_off : s_off + 17] = b"\xe8" + rel + b"\x90" * 12
+            data[l_off : l_off + 16] = b"\x90" * 16
+        modified = True
+        print(f"Patch TViewComponent _AddRef applicata ({len(m_s1) + len(m_s2)} siti)!")
+else:
+    print("TViewComponent _AddRef già patchato o non necessario per questa versione.")
 
-sig = bytes.fromhex("55 48 83 ec 40 48 8b ec 48 89 4d 50 c7 45 34 00 00 00 00 c7 45 2c 00 00 00 00 c7 45 30 00 c0 00 00")
-idx = data.find(sig)
-if idx != -1:
+if modified:
     if not os.path.exists(path + ".orig"):
         with open(path + ".orig", "wb") as bf:
-            bf.write(data)
-    patch = bytes([
-        0xc7, 0x41, 0x18, 0x32, 0x00, 0x00, 0x00,  # movl $50, 0x18(%rcx)
-        0xc7, 0x41, 0x1c, 0x32, 0x00, 0x00, 0x00,  # movl $50, 0x1c(%rcx)
-        0xc3,                                       # ret
-    ]) + b"\x90" * (150 - 15)
-    data[idx : idx + len(patch)] = patch
+            bf.write(orig_snapshot)
     tmp_path = path + ".tmp"
     with open(tmp_path, "wb") as f:
         f.write(data)
     shutil.copymode(path, tmp_path)
     os.replace(tmp_path, path)
-    print("Patch CountAtoms applicata con successo!")
-else:
-    print("Pattern CountAtoms già patchato o non trovato.")
 EOF
-    log_succ "Patch ciclo monitor atom/clipboard verificata/applicata."
+    log_succ "Patch binarie X2.EXE verificate/applicate."
 
-    # 5. Patch Direct2D HWND Presentation in AdvSch.dll
+    # 5. Patch Direct2D HWND Presentation in AdvSch.dll (FUseDC offset rilevato dinamicamente)
     log_info "Applicazione Patch rendering Direct2D schematico (PresentToWnd in AdvSch.dll)..."
     python3 - << EOF
-import os
+import os, re, shutil
 
 advsch_path = os.path.join(os.path.dirname("$X2_EXE"), "System", "AdvSch.dll")
 if os.path.exists(advsch_path):
     with open(advsch_path, "rb") as f:
         data = bytearray(f.read())
+    orig_snapshot = bytes(data)
 
-    sig1 = bytes.fromhex("80 b8 8a 05 00 00 00 74 2a 48 8b 85")
-    sig2 = bytes.fromhex("48 83 79 08 00 0f 95 c1 88 88 8a 05 00 00")
+    m1s = list(re.finditer(rb"\x80\xb8(..\x00\x00)\x00\x74\x2a\x48\x8b\x85", data))
+    m2s = list(re.finditer(rb"\x48\x83\x79\x08\x00\x0f\x95\xc1\x88\x88(..\x00\x00)", data))
+    pairs = [(a, b) for a in m1s for b in m2s if a.group(1) == b.group(1)]
 
-    idx1 = data.find(sig1)
-    idx2 = data.find(sig2)
     patched = False
-
-    if idx1 != -1:
-        data[idx1 + 7 : idx1 + 9] = b"\xeb\x2a"
-        patched = True
-    if idx2 != -1:
-        data[idx2 + 5 : idx2 + 8] = b"\x31\xc9\x90"
+    if pairs:
+        m1, m2 = pairs[0]
+        data[m1.start() + 7 : m1.start() + 9] = b"\xeb\x2a"
+        data[m2.start() + 5 : m2.start() + 8] = b"\x31\xc9\x90"
         patched = True
 
     if patched:
         if not os.path.exists(advsch_path + ".orig"):
             with open(advsch_path + ".orig", "wb") as bf:
-                bf.write(data)
-        with open(advsch_path, "wb") as f:
+                bf.write(orig_snapshot)
+        tmp_path = advsch_path + ".tmp"
+        with open(tmp_path, "wb") as f:
             f.write(data)
+        shutil.copymode(advsch_path, tmp_path)
+        os.replace(tmp_path, advsch_path)
         print("Patch AdvSch.dll (Direct2D HWND PresentToWnd) applicata con successo!")
     else:
         print("AdvSch.dll già patchato o pattern non trovato.")
@@ -323,37 +454,35 @@ import os, glob
 ext_pattern = os.path.join("$TARGET_PREFIX", "drive_c", "ProgramData", "Altium", "Altium Designer *", "Extensions", "Mixed Simulation", "AdvSim.dll")
 matches = glob.glob(ext_pattern)
 if matches:
-    advsim_path = matches[0]
-    with open(advsim_path, "rb") as f:
-        data = bytearray(f.read())
+    for advsim_path in matches:
+        with open(advsim_path, "rb") as f:
+            data = bytearray(f.read())
 
-    sig_orig = bytes.fromhex("55 53 48 83 ec 38 48 8b ec 48 89 cb 48 8d 4d 28 e8 6b d7 d3 ff 48 8b 4d 28 b2 01")
-    patch = bytes.fromhex("48 8b 81 b0 00 00 00 c3") # mov 0xb0(%rcx), %rax; ret
+        sig_orig = bytes.fromhex("55 53 48 83 ec 38 48 8b ec 48 89 cb 48 8d 4d 28 e8 6b d7 d3 ff 48 8b 4d 28 b2 01")
+        patch = bytes.fromhex("48 8b 81 b0 00 00 00 c3") # mov 0xb0(%rcx), %rax; ret
 
-    idx = data.find(sig_orig)
-    if idx != -1:
-        if not os.path.exists(advsim_path + ".orig"):
-            with open(advsim_path + ".orig", "wb") as bf:
-                bf.write(data)
-        data[idx : idx + len(patch)] = patch
-        with open(advsim_path, "wb") as f:
-            f.write(data)
-        print("Patch AdvSim.dll applicata con successo (offset " + hex(idx) + ")!")
-    else:
-        print("AdvSim.dll già patchato o pattern non trovato.")
+        idx = data.find(sig_orig)
+        if idx != -1:
+            if not os.path.exists(advsim_path + ".orig"):
+                with open(advsim_path + ".orig", "wb") as bf:
+                    bf.write(data)
+            data[idx : idx + len(patch)] = patch
+            with open(advsim_path, "wb") as f:
+                f.write(data)
+            print("Patch AdvSim.dll applicata con successo (offset " + hex(idx) + ")!")
+        else:
+            print("AdvSim.dll già patchato o pattern non trovato.")
 else:
-    print("AdvSim.dll non trovato.")
+    print("AdvSim.dll non presente in questa installazione, patch saltata.")
 EOF
     log_succ "Patch hook flood in AdvSim.dll verificata/applicata."
 
     # 4.1 Patch null pointer dereference in ScriptingSystem.dll
-    python3 - << 'EOF'
+    python3 - << EOF
 import os
-import glob
 
-matches = glob.glob(os.path.expandvars("$TARGET_PREFIX/drive_c/Program Files/Altium/*/System/ScriptingSystem.dll"))
-if matches:
-    dll_path = matches[0]
+dll_path = os.path.join(os.path.dirname("$X2_EXE"), "System", "ScriptingSystem.dll")
+if os.path.exists(dll_path):
     with open(dll_path, "rb") as f:
         data = bytearray(f.read())
 
@@ -441,6 +570,66 @@ dxgi.deferSurfaceCreation = True
 d3d9.deferSurfaceCreation = True
 EOF
 
+    # 5.3 Apply Altium performance & network preferences dynamically for every detected Altium GUID in user.reg
+    log_info "Applicazione preferenze Altium (Schematic/PCB/Network) sui profili rilevati..."
+    local DYN_REG_FILE="/tmp/altium_dyn_fixes_$$.reg"
+    python3 - << EOF > "$DYN_REG_FILE"
+import os, re
+
+user_reg = os.path.join("$TARGET_PREFIX", "user.reg")
+guids = {"{098E92C5-2552-44B1-BA35-25D7FC633AAE}", "{F12855C5-BD21-4C4B-BDC8-9239BA72A9A5}"}
+if os.path.exists(user_reg):
+    with open(user_reg, "r", encoding="utf-8", errors="ignore") as f:
+        for m in re.finditer(r"Software\\\\Altium\\\\Altium Designer (\{[0-9A-Fa-f-]+\})", f.read()):
+            guids.add(m.group(1).upper())
+
+print("Windows Registry Editor Version 5.00\n")
+for g in sorted(guids):
+    base = f"HKEY_CURRENT_USER\\\\Software\\\\Altium\\\\Altium Designer {g}\\\\DesignExplorer\\\\Preferences"
+    print(f"""[{base}\\\\SCH\\\\Schematic Preferences]
+"BufferedPainting"="1"
+"AlwaysDrag"="0"
+"SpatialAnalysisDuringDragging"="0"
+"OptimizePolylines"="1"
+"Display Printer Fonts"="0"
+
+[{base}\\\\Schematic Preferences\\\\General]
+"BufferedPainting"="1"
+
+[{base}\\\\AdvPCB\\\\SystemOptions]
+"UseAnimation"="0"
+"UseSmoothZoom"="0"
+"CleanRedraw"="1"
+
+[{base}\\\\Client\\\\Client Preferences]
+"Animated Panels"="0"
+"Animation Speed"=dword:00000000
+"Auto Transparent Toolbars"="0"
+"Dynamic Auto Transparency"="0"
+"AllowedNetworkActivity"="AltiumPortal;AltiumCloud;AltiumVault;Browser;LicenseServer;Suppliers"
+"ConnectivityInsight"="0"
+"ConnectivityInsightHoverPreview"="0"
+"ConnectivityInsightHoverTextHint"="0"
+"ConnectivityInsightHoverTree"="0"
+"HyperlinkInsight"="0"
+"HyperlinkInsightHoverEnabled"="0"
+"DocumnetInsight"="0"
+"ProjectInsight"="0"
+""")
+EOF
+    WINEPREFIX="$TARGET_PREFIX" wine regedit "$DYN_REG_FILE" >/dev/null 2>&1 || true
+    WINEPREFIX="$TARGET_PREFIX" wineserver -w 2>/dev/null || true
+    rm -f "$DYN_REG_FILE"
+
+    local ALTIUM_VER
+    ALTIUM_VER="$(basename "$ALTIUM_DIR")"
+    local LOCALE_LINE=""
+    local EXTRA_CEF_FLAGS=""
+    if [[ "$IS_DOTNET_FX" = true ]]; then
+        LOCALE_LINE='export LC_ALL="${LC_ALL:-en_US.UTF-8}"'
+        EXTRA_CEF_FLAGS="--disable-gpu --disable-gpu-compositing "
+    fi
+
     log_info "Creazione dello script di avvio in: $LAUNCHER_SCRIPT"
     cat << EOF > "$LAUNCHER_SCRIPT"
 #!/usr/bin/env bash
@@ -448,6 +637,7 @@ export WINEPREFIX="$TARGET_PREFIX"
 export WINEARCH="win64"
 export WINEDEBUG="\${WINEDEBUG:--all}"
 export WINEDLLOVERRIDES="d2d1=n,b;gdiplus=n,b;vbscript=n,b;msado15=n,b"
+$LOCALE_LINE
 
 # Disabilita VSync a livello driver e DXVK per ridisegno immediato e reattivo
 export __GL_SYNC_TO_VBLANK=0
@@ -482,6 +672,8 @@ if [[ -x "\$CUSTOM_WINESERVER" ]]; then
     export WINESERVER="\$CUSTOM_WINESERVER"
     NEED_START=1
     for ws_pid in \$(pidof wineserver 2>/dev/null || true); do
+        WS_PREFIX=\$(tr '\0' '\n' < "/proc/\$ws_pid/environ" 2>/dev/null | sed -n 's/^WINEPREFIX=//p' | head -n 1 || true)
+        [[ "\$WS_PREFIX" == "\$WINEPREFIX" ]] || continue
         EXE_PATH=\$(readlink -f "/proc/\$ws_pid/exe" 2>/dev/null || true)
         if [[ "\$EXE_PATH" == "\$CUSTOM_WINESERVER" ]]; then
             NEED_START=0
@@ -503,7 +695,7 @@ if [[ ! -f "\$ALTIUM_EXE" ]]; then
     exit 1
 fi
 
-"\$WINE_BIN" "\$ALTIUM_EXE" --disable-gpu-sandbox --renderer-process-limit=2 --js-flags="--max-old-space-size=256" "\$@"
+"\$WINE_BIN" "\$ALTIUM_EXE" ${EXTRA_CEF_FLAGS}--disable-gpu-sandbox --renderer-process-limit=2 --js-flags="--max-old-space-size=256" "\$@"
 EOF
     chmod +x "$LAUNCHER_SCRIPT"
     log_succ "Script di avvio creato."
@@ -523,10 +715,17 @@ EOF
     local DESKTOP_DIR="$HOME/.local/share/applications"
     mkdir -p "$DESKTOP_DIR"
     local DESKTOP_FILE="$DESKTOP_DIR/altium-designer.desktop"
+    local DESKTOP_NAME="Altium Designer"
+    if [[ "$TARGET_PREFIX" != "$HOME/.wine-prefixes/altium" && "$ALTIUM_VER" != "AD26" ]]; then
+        local VER_SLUG
+        VER_SLUG="$(echo "$ALTIUM_VER" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
+        DESKTOP_FILE="$DESKTOP_DIR/altium-designer-${VER_SLUG}.desktop"
+        DESKTOP_NAME="Altium Designer ($ALTIUM_VER)"
+    fi
     cat << EOF > "$DESKTOP_FILE"
 [Desktop Entry]
-Name=Altium Designer
-Comment=Altium Designer on Wine
+Name=$DESKTOP_NAME
+Comment=Altium Designer on Wine ($ALTIUM_VER)
 Exec=$LAUNCHER_SCRIPT
 Icon=$ICON_PATH
 Terminal=false
@@ -711,8 +910,15 @@ EOF
     echo -e "${BOLD}${GREEN}  Configurazione e correzioni completate con successo!           ${NC}"
     echo -e "${BOLD}${GREEN}================================================================${NC}"
     echo "Puoi avviare Altium Designer:"
-    echo "  1. Cercandolo nel menu delle applicazioni (Altium Designer)"
+    echo "  1. Cercandolo nel menu delle applicazioni ($DESKTOP_NAME)"
     echo "  2. Dal terminale: $LAUNCHER_SCRIPT"
+    if [[ "$IS_DOTNET_FX" = true ]]; then
+        echo ""
+        log_info "Nota per Altium Designer ($ALTIUM_VER) con runtime .NET Framework 4.8:"
+        echo "  - Se il dialogo in-app 'Sign in' accetta solo Email/Password (es. AD20.0.9)"
+        echo "    e usi normalmente Google, imposta una password Altium tramite 'Forgotten password ?'"
+        echo "    su https://myaccount.altium.com/ oppure usa una licenza standalone (.alf) / Private License Server."
+    fi
     echo ""
 }
 
@@ -720,12 +926,35 @@ EOF
 configure_prefix_environment() {
     mkdir -p "$TARGET_PREFIX"
     log_info "Configurazione del Wine prefix in: $TARGET_PREFIX..."
-    wineboot -u
+    # Skip wineboot -u when dotnet48 is already installed: BaseWow64Install runs
+    # RegisterDlls on syswow64 mscoree.dll and pops a modal rundll32 error dialog.
+    if [[ ! -f "$TARGET_PREFIX/system.reg" || ! -f "$TARGET_PREFIX/dosdevices/c:/windows/dotnet48.installed.workaround" ]]; then
+        wineboot -u
+    fi
 
-    log_info "Installazione dei componenti tramite winetricks (corefonts, tahoma, fontsmooth-rgb, d3dcompiler_47, dxvk)..."
-    winetricks -q win10 corefonts tahoma fontsmooth-rgb d3dcompiler_47 dxvk || {
-        log_warn "Winetricks completato con avvisi non critici. Si prosegue..."
-    }
+    local WT_LOG="$TARGET_PREFIX/winetricks.log"
+    local NEED_TRICKS=()
+    local WIN_VER_OK=false
+    if [[ -f "$WT_LOG" ]] && [[ "$(grep -E '^(win10|win7|winxp)$' "$WT_LOG" | tail -n 1 || true)" == "win10" ]]; then
+        WIN_VER_OK=true
+    fi
+    [[ "$WIN_VER_OK" = true ]] || NEED_TRICKS+=("win10")
+    for pair in "corefonts:corefonts" "tahoma:tahoma" "fontsmooth-rgb:fontsmooth=rgb" "d3dcompiler_47:d3dcompiler_47" "dxvk:dxvk"; do
+        local pkg="${pair%%:*}"
+        local entry="${pair#*:}"
+        if [[ ! -f "$WT_LOG" ]] || ! grep -qxF "$entry" "$WT_LOG"; then
+            NEED_TRICKS+=("$pkg")
+        fi
+    done
+
+    if [[ ${#NEED_TRICKS[@]} -gt 0 ]]; then
+        log_info "Installazione dei componenti tramite winetricks (${NEED_TRICKS[*]})..."
+        winetricks -q "${NEED_TRICKS[@]}" || {
+            log_warn "Winetricks completato con avvisi non critici. Si prosegue..."
+        }
+    else
+        log_succ "Componenti winetricks base già installati nel prefix."
+    fi
 
     log_info "Installazione e sincronizzazione font di sistema (Segoe UI, Tahoma)..."
     mkdir -p "$TARGET_PREFIX/drive_c/windows/Fonts" "$HOME/.local/share/fonts/segoe-ui" "$HOME/.local/share/fonts/tahoma"
@@ -803,7 +1032,7 @@ Windows Registry Editor Version 5.00
 "Animation Speed"=dword:00000000
 "Auto Transparent Toolbars"="0"
 "Dynamic Auto Transparency"="0"
-"AllowedNetworkActivity"="LicenseServer"
+"AllowedNetworkActivity"="AltiumPortal;AltiumCloud;AltiumVault;Browser;LicenseServer;Suppliers"
 "ConnectivityInsight"="0"
 "ConnectivityInsightHoverPreview"="0"
 "ConnectivityInsightHoverTextHint"="0"
@@ -815,6 +1044,7 @@ Windows Registry Editor Version 5.00
 EOF
 
     wine regedit "$REG_FIX_FILE"
+    wineserver -w 2>/dev/null || true
     rm -f "$REG_FIX_FILE"
 
     # Setup xdg-open.exe in Wine so any process calling xdg-open delegates to host browser
@@ -917,7 +1147,9 @@ if [[ "$(basename "$INSTALLER_PATH")" =~ ^AltiumDesignerSetup ]]; then
     echo "L'installer online richiede l'autenticazione per scaricare i pacchetti di Altium."
     echo "Stiamo per aprire il tuo browser di sistema per effettuare l'accesso in sicurezza."
     echo ""
-    read -rp "$(echo -e "${BOLD}Premi [INVIO] per aprire il browser ed eseguire l'accesso...${NC}")"
+    if [[ "$NON_INTERACTIVE" != true ]]; then
+        read -rp "$(echo -e "${BOLD}Premi [INVIO] per aprire il browser ed eseguire l'accesso...${NC}")"
+    fi
 
     log_info "Avvio del bridge OAuth nativo..."
     set +e
@@ -1043,7 +1275,19 @@ echo -e "${YELLOW}Lo script attenderà il completamento dell'installazione...${N
 
 if [[ -n "$SESSION_TOKEN" ]]; then
     # Online installer with pre-authenticated session
-    wine "$INSTALLER_PATH" -SessionId:"$SESSION_TOKEN" -Install || true
+    # AD24+ accepts "-SessionId:<tok> -Install"; older installers (e.g. AD20/AD22) use "-SessionID:<tok>" without "-Install"
+    HAS_STANDALONE_INSTALL="$(python3 - << EOF
+data = open("$INSTALLER_PATH", "rb").read()
+u = "-Install\x00".encode("utf-16le")
+a = b"-Install\x00"
+print("yes" if (u in data or a in data) else "no")
+EOF
+)"
+    if [[ "$HAS_STANDALONE_INSTALL" == "yes" ]]; then
+        wine "$INSTALLER_PATH" -SessionId:"$SESSION_TOKEN" -Install || true
+    else
+        wine "$INSTALLER_PATH" -SessionID:"$SESSION_TOKEN" || true
+    fi
 else
     # Offline or standard setup
     wine "$INSTALLER_PATH" || true
